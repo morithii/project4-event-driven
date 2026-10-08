@@ -1,0 +1,244 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Project 4 - Event-Driven Orders Application
+
+Globals:
+  Function:
+    Runtime: nodejs22.x
+    Architectures:
+      - arm64
+    MemorySize: 256
+    Timeout: 10
+    Tags:
+      Project: project4-event-driven
+  Api:
+    OpenApiVersion: '3.0.1'
+
+Resources:
+  # Regular single-region table. Multi-region returns in the Global Endpoints exercise.
+  OrdersTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: project4-orders
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: orderId
+          AttributeType: S
+        - AttributeName: itemId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: orderId
+          KeyType: HASH
+        - AttributeName: itemId
+          KeyType: RANGE
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      Tags:
+        - Key: Project
+          Value: project4-event-driven
+
+  OrdersUserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: project4-orders-users
+      UsernameAttributes:
+        - email
+      AutoVerifiedAttributes:
+        - email
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 12
+          RequireUppercase: true
+          RequireLowercase: true
+          RequireNumbers: true
+          RequireSymbols: true
+      AccountRecoverySetting:
+        RecoveryMechanisms:
+          - Name: verified_email
+            Priority: 1
+      UserPoolTags:
+        Project: project4-event-driven
+
+  OrdersUserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: project4-orders-client
+      UserPoolId: !Ref OrdersUserPool
+      GenerateSecret: false
+      ExplicitAuthFlows:
+        - ALLOW_USER_PASSWORD_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+      PreventUserExistenceErrors: ENABLED
+      IdTokenValidity: 60
+      AccessTokenValidity: 60
+      TokenValidityUnits:
+        IdToken: minutes
+        AccessToken: minutes
+
+  # Role API Gateway assumes to read from DynamoDB (Query only, this table only)
+  ApiGatewayDynamoDBReadRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: apigateway.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: QueryOrdersTable
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: dynamodb:Query
+                Resource: !GetAtt OrdersTable.Arn
+      Tags:
+        - Key: Project
+          Value: project4-event-driven
+
+  OrdersApi:
+    Type: AWS::Serverless::Api
+    Properties:
+      Name: project4-orders-api
+      StageName: prod
+      Auth:
+        DefaultAuthorizer: CognitoAuthorizer
+        Authorizers:
+          CognitoAuthorizer:
+            UserPoolArn: !GetAtt OrdersUserPool.Arn
+      DefinitionBody:
+        openapi: '3.0.1'
+        info:
+          title: project4-orders-api
+          version: '1.0'
+        paths:
+          /orders:
+            post:
+              summary: Create an order (Lambda proxy integration)
+              security:
+                - CognitoAuthorizer: []
+              responses:
+                '201':
+                  description: Order created
+              x-amazon-apigateway-integration:
+                type: aws_proxy
+                httpMethod: POST
+                uri: !Join ["", ["arn:aws:apigateway:", !Ref "AWS::Region", ":lambda:path/2015-03-31/functions/", !GetAtt CreateOrderFunction.Arn, "/invocations"]]
+          /orders/{orderId}:
+            get:
+              summary: Get an order directly from DynamoDB (no Lambda)
+              parameters:
+                - name: orderId
+                  in: path
+                  required: true
+                  schema:
+                    type: string
+              security:
+                - CognitoAuthorizer: []
+              responses:
+                '200':
+                  description: The order
+                '404':
+                  description: Order not found
+              x-amazon-apigateway-integration:
+                type: aws
+                httpMethod: POST
+                uri: !Join ["", ["arn:aws:apigateway:", !Ref "AWS::Region", ":dynamodb:action/Query"]]
+                credentials: !GetAtt ApiGatewayDynamoDBReadRole.Arn
+                passthroughBehavior: never
+                requestTemplates:
+                  # Table name is hard-coded here because this is a VTL mapping template,
+                  # not a CloudFormation property. Keep in sync with OrdersTable.TableName.
+                  application/json: |
+                    {
+                      "TableName": "project4-orders",
+                      "KeyConditionExpression": "orderId = :o",
+                      "ExpressionAttributeValues": {
+                        ":o": {"S": "$util.escapeJavaScript($input.params('orderId'))"}
+                      }
+                    }
+                responses:
+                  default:
+                    statusCode: '200'
+                    responseTemplates:
+                      application/json: |
+                        #set($inputRoot = $input.path('$'))
+                        #if($inputRoot.Count == 0)
+                        #set($context.responseOverride.status = 404)
+                        {"message": "Order not found"}
+                        #else
+                        {
+                          "orderId": "$inputRoot.Items[0].orderId.S",
+                          "customerId": "$inputRoot.Items[0].customerId.S",
+                          "createdAt": "$inputRoot.Items[0].createdAt.S",
+                          "items": [
+                        #foreach($item in $inputRoot.Items)
+                            {"itemId": "$item.itemId.S", "productId": "$item.productId.S", "quantity": $item.quantity.N, "price": $item.price.N}#if($foreach.hasNext),#end
+                        #end
+                          ]
+                        }
+                        #end
+      Tags:
+        Project: project4-event-driven
+
+  CreateOrderFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: project4-create-order
+      Description: Saves a new order to the Orders table
+      CodeUri: src/create-order/
+      Handler: index.handler
+      Tracing: Active
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref OrdersTable
+      Policies:
+        - DynamoDBWritePolicy:
+            TableName: !Ref OrdersTable
+
+  CreateOrderApiPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref CreateOrderFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Join ["", ["arn:aws:execute-api:", !Ref "AWS::Region", ":", !Ref "AWS::AccountId", ":", !Ref OrdersApi, "/*/POST/orders"]]
+
+  OrdersDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: project4-orders-dashboard
+      DashboardBody: !Join
+        - ""
+        - - '{"widgets":['
+          - '{"type":"metric","x":0,"y":0,"width":12,"height":6,"properties":{"title":"API Gateway - Requests and 4XX Errors","region":"'
+          - !Ref "AWS::Region"
+          - '","stat":"Sum","period":60,"view":"timeSeries","metrics":[["AWS/ApiGateway","Count","ApiName","project4-orders-api"],["AWS/ApiGateway","4XXError","ApiName","project4-orders-api"]]}},'
+          - '{"type":"metric","x":12,"y":0,"width":12,"height":6,"properties":{"title":"Lambda - Invocations and Errors","region":"'
+          - !Ref "AWS::Region"
+          - '","stat":"Sum","period":60,"view":"timeSeries","metrics":[["AWS/Lambda","Invocations","FunctionName","'
+          - !Ref CreateOrderFunction
+          - '"],["AWS/Lambda","Errors","FunctionName","'
+          - !Ref CreateOrderFunction
+          - '"]]}}'
+          - ']}'
+
+Outputs:
+  OrdersTableName:
+    Value: !Ref OrdersTable
+  OrdersTableArn:
+    Value: !GetAtt OrdersTable.Arn
+  CreateOrderFunctionArn:
+    Value: !GetAtt CreateOrderFunction.Arn
+  OrdersApiUrl:
+    Description: POST orders to this URL
+    Value: !Join ["", ["https://", !Ref OrdersApi, ".execute-api.", !Ref "AWS::Region", ".amazonaws.com/prod/orders"]]
+  UserPoolId:
+    Value: !Ref OrdersUserPool
+  UserPoolClientId:
+    Value: !Ref OrdersUserPoolClient
+  DashboardUrl:
+    Description: Open this to see the dashboard
+    Value: !Join ["", ["https://", !Ref "AWS::Region", ".console.aws.amazon.com/cloudwatch/home?region=", !Ref "AWS::Region", "#dashboards:name=project4-orders-dashboard"]]

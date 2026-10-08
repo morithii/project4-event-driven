@@ -1,0 +1,9 @@
+{
+  "httpMethod": "POST",
+  "path": "/orders",
+  "headers": {
+    "Content-Type": "application/json"
+  },
+  "isBase64Encoded": false,
+  "body": "{\"customerId\":\"cust-local\",\"items\":[{\"productId\":\"mug-01\",\"quantity\":1,\"price\":8.5}]}"
+}
