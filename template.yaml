@@ -1,48 +1,67 @@
+# =============================================================================
+# Project 4 - Event-Driven Orders Application
+# Built on Project 3's orders API. Flow so far:
+#   POST /orders -> API Gateway (Cognito auth) -> CreateOrder Lambda
+#                -> DynamoDB (saves order) -> EventBridge (OrderCreated event)
+#   GET /orders/{id} -> API Gateway -> DynamoDB directly (no Lambda)
+# =============================================================================
 AWSTemplateFormatVersion: '2010-09-09'
-Transform: AWS::Serverless-2016-10-31
+Transform: AWS::Serverless-2016-10-31   # makes this a SAM template (enables AWS::Serverless::* shorthand)
 Description: Project 4 - Event-Driven Orders Application
 
+# Settings applied to every function/API in this template, so they aren't repeated
 Globals:
   Function:
-    Runtime: nodejs22.x
+    Runtime: nodejs22.x       # Node.js version Lambda runs the code on
     Architectures:
-      - arm64
-    MemorySize: 256
-    Timeout: 10
+      - arm64                 # Graviton processors: ~20% cheaper than x86 for the same work
+    MemorySize: 256           # MB; CPU is allocated in proportion to memory
+    Timeout: 10               # seconds before Lambda kills a stuck invocation
     Tags:
       Project: project4-event-driven
   Api:
-    OpenApiVersion: '3.0.1'
+    OpenApiVersion: '3.0.1'   # stops SAM creating an extra unused "Stage" stage
 
 Resources:
-  # Regular single-region table. Multi-region returns in the Global Endpoints exercise.
+
+  # ---------------------------------------------------------------------------
+  # DATA
+  # ---------------------------------------------------------------------------
+
+  # Stores orders. One row per item: orderId groups an order's rows, itemId tells them apart.
+  # Regular single-region table - multi-region returns in the Global Endpoints exercise.
   OrdersTable:
     Type: AWS::DynamoDB::Table
     Properties:
       TableName: project4-orders
-      BillingMode: PAY_PER_REQUEST
-      AttributeDefinitions:
+      BillingMode: PAY_PER_REQUEST      # on-demand: pay per request, no capacity planning
+      AttributeDefinitions:             # only key attributes are declared; others are schemaless
         - AttributeName: orderId
-          AttributeType: S
+          AttributeType: S              # S = string
         - AttributeName: itemId
           AttributeType: S
       KeySchema:
         - AttributeName: orderId
-          KeyType: HASH
+          KeyType: HASH                 # partition key: decides which partition stores the row
         - AttributeName: itemId
-          KeyType: RANGE
+          KeyType: RANGE                # sort key: orders rows within the same orderId
       PointInTimeRecoverySpecification:
-        PointInTimeRecoveryEnabled: true
+        PointInTimeRecoveryEnabled: true   # restore the table to any second in the last 35 days
       Tags:
         - Key: Project
           Value: project4-event-driven
 
+  # ---------------------------------------------------------------------------
+  # AUTHENTICATION
+  # ---------------------------------------------------------------------------
+
+  # The user directory. API callers must log in here to get a token.
   OrdersUserPool:
     Type: AWS::Cognito::UserPool
     Properties:
       UserPoolName: project4-orders-users
       UsernameAttributes:
-        - email
+        - email                         # users log in with their email address
       AutoVerifiedAttributes:
         - email
       Policies:
@@ -54,39 +73,45 @@ Resources:
           RequireSymbols: true
       AccountRecoverySetting:
         RecoveryMechanisms:
-          - Name: verified_email
+          - Name: verified_email        # password resets go to the verified email
             Priority: 1
       UserPoolTags:
         Project: project4-event-driven
 
+  # The "app" allowed to log users in. Its ID is used by initiate-auth.
   OrdersUserPoolClient:
     Type: AWS::Cognito::UserPoolClient
     Properties:
       ClientName: project4-orders-client
       UserPoolId: !Ref OrdersUserPool
-      GenerateSecret: false
+      GenerateSecret: false             # public client (CLI/browser) - a secret couldn't be kept safe
       ExplicitAuthFlows:
-        - ALLOW_USER_PASSWORD_AUTH
-        - ALLOW_REFRESH_TOKEN_AUTH
-      PreventUserExistenceErrors: ENABLED
+        - ALLOW_USER_PASSWORD_AUTH      # log in with username + password (what our curl tests use)
+        - ALLOW_REFRESH_TOKEN_AUTH      # swap a refresh token for new tokens without a password
+      PreventUserExistenceErrors: ENABLED   # same error for "wrong password" and "no such user"
       IdTokenValidity: 60
       AccessTokenValidity: 60
       TokenValidityUnits:
-        IdToken: minutes
+        IdToken: minutes                # tokens expire after 60 minutes
         AccessToken: minutes
 
-  # Role API Gateway assumes to read from DynamoDB (Query only, this table only)
+  # ---------------------------------------------------------------------------
+  # API
+  # ---------------------------------------------------------------------------
+
+  # Role API Gateway assumes for GET /orders/{id}, so it can query DynamoDB itself.
+  # Least privilege: Query only, on this table only.
   ApiGatewayDynamoDBReadRole:
     Type: AWS::IAM::Role
     Properties:
-      AssumeRolePolicyDocument:
+      AssumeRolePolicyDocument:         # trust policy: WHO can use this role (API Gateway)
         Version: '2012-10-17'
         Statement:
           - Effect: Allow
             Principal:
               Service: apigateway.amazonaws.com
             Action: sts:AssumeRole
-      Policies:
+      Policies:                         # permissions: WHAT the role can do
         - PolicyName: QueryOrdersTable
           PolicyDocument:
             Version: '2012-10-17'
@@ -98,13 +123,14 @@ Resources:
         - Key: Project
           Value: project4-event-driven
 
+  # The REST API. Routes are defined in OpenAPI format inside DefinitionBody.
   OrdersApi:
     Type: AWS::Serverless::Api
     Properties:
       Name: project4-orders-api
-      StageName: prod
+      StageName: prod                   # becomes the /prod part of the URL
       Auth:
-        DefaultAuthorizer: CognitoAuthorizer
+        DefaultAuthorizer: CognitoAuthorizer   # every route needs a valid Cognito token
         Authorizers:
           CognitoAuthorizer:
             UserPoolArn: !GetAtt OrdersUserPool.Arn
@@ -114,6 +140,7 @@ Resources:
           title: project4-orders-api
           version: '1.0'
         paths:
+          # POST /orders -> CreateOrder Lambda
           /orders:
             post:
               summary: Create an order (Lambda proxy integration)
@@ -123,9 +150,10 @@ Resources:
                 '201':
                   description: Order created
               x-amazon-apigateway-integration:
-                type: aws_proxy
-                httpMethod: POST
+                type: aws_proxy           # proxy: the whole request is passed to the Lambda as-is
+                httpMethod: POST          # API Gateway always calls Lambda with POST
                 uri: !Join ["", ["arn:aws:apigateway:", !Ref "AWS::Region", ":lambda:path/2015-03-31/functions/", !GetAtt CreateOrderFunction.Arn, "/invocations"]]
+          # GET /orders/{orderId} -> DynamoDB Query directly, no Lambda
           /orders/{orderId}:
             get:
               summary: Get an order directly from DynamoDB (no Lambda)
@@ -143,14 +171,15 @@ Resources:
                 '404':
                   description: Order not found
               x-amazon-apigateway-integration:
-                type: aws
-                httpMethod: POST
+                type: aws                 # non-proxy: we translate request/response with templates
+                httpMethod: POST          # DynamoDB's API is always called with POST
                 uri: !Join ["", ["arn:aws:apigateway:", !Ref "AWS::Region", ":dynamodb:action/Query"]]
                 credentials: !GetAtt ApiGatewayDynamoDBReadRole.Arn
                 passthroughBehavior: never
+                # Request template: turns the URL's orderId into a DynamoDB Query.
+                # The table name is hard-coded because this is VTL text, not a CloudFormation
+                # property - keep it in sync with OrdersTable.TableName.
                 requestTemplates:
-                  # Table name is hard-coded here because this is a VTL mapping template,
-                  # not a CloudFormation property. Keep in sync with OrdersTable.TableName.
                   application/json: |
                     {
                       "TableName": "project4-orders",
@@ -159,6 +188,8 @@ Resources:
                         ":o": {"S": "$util.escapeJavaScript($input.params('orderId'))"}
                       }
                     }
+                # Response template: reshapes DynamoDB's typed JSON ({"S": "..."}) into
+                # clean JSON, and returns 404 when no rows were found.
                 responses:
                   default:
                     statusCode: '200'
@@ -183,29 +214,94 @@ Resources:
       Tags:
         Project: project4-event-driven
 
+  # ---------------------------------------------------------------------------
+  # EVENTS (Exercise 1)
+  # ---------------------------------------------------------------------------
+
+  # Custom event bus for this app. The account's "default" bus receives AWS
+  # service events; a custom bus keeps our order events separate, so our
+  # rules only ever see our events.
+  OrdersEventBus:
+    Type: AWS::Events::EventBus
+    Properties:
+      Name: project4-orders-bus
+      Tags:
+        - Key: Project
+          Value: project4-event-driven
+
+  # DEBUG: a bus with no rules silently discards events. This log group, plus
+  # the rule below, keeps a copy of every order event so we can see what's
+  # being published.
+  OrderEventsLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/events/project4-orders-bus   # must start with /aws/events/ for EventBridge
+      RetentionInDays: 7                              # auto-delete after a week, so costs stay at ~0
+
+  # Resource policy ON the log group, allowing EventBridge to write into it.
+  # Without this the rule still matches, but nothing arrives - and no error is shown.
+  OrderEventsLogGroupPolicy:
+    Type: AWS::Logs::ResourcePolicy
+    Properties:
+      PolicyName: project4-orders-bus-to-logs
+      PolicyDocument: !Sub '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":["events.amazonaws.com","delivery.logs.amazonaws.com"]},"Action":["logs:CreateLogStream","logs:PutLogEvents"],"Resource":"${OrderEventsLogGroup.Arn}"}]}'
+
+  # Rule: "any event from source project4.orders -> copy it to the log group"
+  LogAllOrderEventsRule:
+    Type: AWS::Events::Rule
+    DependsOn: OrderEventsLogGroupPolicy   # create the permission first, so no early events are dropped
+    Properties:
+      Name: project4-log-all-order-events
+      EventBusName: !Ref OrdersEventBus    # listen on our custom bus, not "default"
+      State: ENABLED
+      EventPattern:                        # which events match: only those with this source
+        source:
+          - project4.orders
+      Targets:
+        - Id: OrderEventsLogGroup
+          Arn: !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:${OrderEventsLogGroup}
+
+  # ---------------------------------------------------------------------------
+  # COMPUTE
+  # ---------------------------------------------------------------------------
+
+  # Handles POST /orders: validates the order, saves it to DynamoDB, then
+  # announces it by publishing an OrderCreated event to the bus.
   CreateOrderFunction:
-    Type: AWS::Serverless::Function
+    Type: AWS::Serverless::Function     # SAM shorthand: expands into a Lambda function plus its IAM role
     Properties:
       FunctionName: project4-create-order
-      Description: Saves a new order to the Orders table
-      CodeUri: src/create-order/
-      Handler: index.handler
-      Tracing: Active
+      Description: Saves a new order and publishes an OrderCreated event
+      CodeUri: src/create-order/        # folder SAM packages and uploads as the function's code
+      Handler: index.handler            # file "index", exported function "handler"
+      Tracing: Active                   # X-Ray traces: see each call this function makes and how long it takes
       Environment:
-        Variables:
-          TABLE_NAME: !Ref OrdersTable
-      Policies:
-        - DynamoDBWritePolicy:
+        Variables:                      # read in code via process.env, so nothing is hard-coded
+          TABLE_NAME: !Ref OrdersTable          # !Ref on a table returns its name
+          EVENT_BUS_NAME: !Ref OrdersEventBus   # !Ref on an event bus returns its name
+      Policies:                         # SAM builds the function's IAM role from these
+        - DynamoDBWritePolicy:          # write-only, this table only
             TableName: !Ref OrdersTable
+        - EventBridgePutEventsPolicy:   # events:PutEvents on this bus only - least privilege
+            EventBusName: !Ref OrdersEventBus
 
+  # Lets API Gateway invoke the Lambda. Needed because the POST route is defined
+  # in DefinitionBody rather than in the function's Events block (where SAM would add it).
   CreateOrderApiPermission:
     Type: AWS::Lambda::Permission
     Properties:
       Action: lambda:InvokeFunction
       FunctionName: !Ref CreateOrderFunction
       Principal: apigateway.amazonaws.com
+      # Only this API's POST /orders route may invoke it - not any API in the account
       SourceArn: !Join ["", ["arn:aws:execute-api:", !Ref "AWS::Region", ":", !Ref "AWS::AccountId", ":", !Ref OrdersApi, "/*/POST/orders"]]
 
+  # ---------------------------------------------------------------------------
+  # MONITORING
+  # ---------------------------------------------------------------------------
+
+  # Dashboard: API traffic + client errors, and Lambda invocations + errors.
+  # The body is JSON built with !Join so the region and function name can be inserted.
   OrdersDashboard:
     Type: AWS::CloudWatch::Dashboard
     Properties:
@@ -213,9 +309,11 @@ Resources:
       DashboardBody: !Join
         - ""
         - - '{"widgets":['
+          # Widget 1 (left): API Gateway request count and 4XX errors
           - '{"type":"metric","x":0,"y":0,"width":12,"height":6,"properties":{"title":"API Gateway - Requests and 4XX Errors","region":"'
           - !Ref "AWS::Region"
           - '","stat":"Sum","period":60,"view":"timeSeries","metrics":[["AWS/ApiGateway","Count","ApiName","project4-orders-api"],["AWS/ApiGateway","4XXError","ApiName","project4-orders-api"]]}},'
+          # Widget 2 (right): Lambda invocations and errors
           - '{"type":"metric","x":12,"y":0,"width":12,"height":6,"properties":{"title":"Lambda - Invocations and Errors","region":"'
           - !Ref "AWS::Region"
           - '","stat":"Sum","period":60,"view":"timeSeries","metrics":[["AWS/Lambda","Invocations","FunctionName","'
@@ -225,6 +323,7 @@ Resources:
           - '"]]}}'
           - ']}'
 
+# Values published on the stack - shown by "aws cloudformation describe-stacks"
 Outputs:
   OrdersTableName:
     Value: !Ref OrdersTable
@@ -242,3 +341,9 @@ Outputs:
   DashboardUrl:
     Description: Open this to see the dashboard
     Value: !Join ["", ["https://", !Ref "AWS::Region", ".console.aws.amazon.com/cloudwatch/home?region=", !Ref "AWS::Region", "#dashboards:name=project4-orders-dashboard"]]
+  OrdersEventBusName:
+    Value: !Ref OrdersEventBus
+  OrdersEventBusArn:
+    Value: !GetAtt OrdersEventBus.Arn
+  OrderEventsLogGroupName:
+    Value: !Ref OrderEventsLogGroup
