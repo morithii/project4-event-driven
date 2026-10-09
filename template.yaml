@@ -2,7 +2,9 @@
 # Project 4 - Event-Driven Orders Application
 # Built on Project 3's orders API. Flow so far:
 #   POST /orders -> API Gateway (Cognito auth) -> CreateOrder Lambda
-#                -> DynamoDB (saves order) -> EventBridge (OrderCreated event)
+#                -> DynamoDB Orders table -> EventBridge (OrderCreated event)
+#   OrderCreated -> EventBridge rule -> SQS queue -> FulfilOrder Lambda
+#                -> DynamoDB Fulfilments table
 #   GET /orders/{id} -> API Gateway -> DynamoDB directly (no Lambda)
 # =============================================================================
 AWSTemplateFormatVersion: '2010-09-09'
@@ -262,6 +264,87 @@ Resources:
           Arn: !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:${OrderEventsLogGroup}
 
   # ---------------------------------------------------------------------------
+  # FULFILMENT (Exercise 2)
+  # OrderCreated -> rule -> FulfilmentQueue -> FulfilOrder Lambda -> FulfilmentsTable
+  # ---------------------------------------------------------------------------
+
+  # One row per order, recording its fulfilment status. Separate from the
+  # Orders table because it belongs to a different part of the business
+  # (the warehouse), which owns its own data.
+  FulfilmentsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: project4-fulfilments
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: orderId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: orderId
+          KeyType: HASH                 # one fulfilment per order, so no sort key needed
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      Tags:
+        - Key: Project
+          Value: project4-event-driven
+
+  # Buffer between EventBridge and FulfilOrder: absorbs spikes, keeps messages
+  # safe if the Lambda is failing, and retries them automatically.
+  FulfilmentQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: project4-fulfilment-queue
+      # How long a message is hidden from other consumers while Lambda works on it.
+      # AWS recommends at least 6x the function timeout (10s), so a slow attempt
+      # isn't handed to a second Lambda while the first is still running.
+      VisibilityTimeout: 60
+      MessageRetentionPeriod: 345600    # 4 days (in seconds) before an unprocessed message is deleted
+      SqsManagedSseEnabled: true        # encrypt messages at rest, using SQS-managed keys (free)
+      Tags:
+        - Key: Project
+          Value: project4-event-driven
+
+  # Resource policy ON the queue: lets EventBridge send messages into it, but
+  # ONLY from our fulfilment rule. Without this, the rule matches events but
+  # delivery silently fails.
+  FulfilmentQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues:
+        - !Ref FulfilmentQueue          # !Ref on a queue returns its URL
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sqs:SendMessage
+            Resource: !GetAtt FulfilmentQueue.Arn
+            Condition:
+              ArnEquals:
+                # Without this condition, ANY EventBridge rule in ANY account
+                # could push messages into the queue (the "confused deputy" problem)
+                aws:SourceArn: !GetAtt OrderCreatedToFulfilmentRule.Arn
+
+  # Rule: "OrderCreated events from our app -> the fulfilment queue".
+  # More specific than the debug rule: it also matches on detail-type, so
+  # future event types (e.g. OrderCancelled) won't be sent to fulfilment.
+  OrderCreatedToFulfilmentRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: project4-order-created-to-fulfilment
+      EventBusName: !Ref OrdersEventBus
+      State: ENABLED
+      EventPattern:
+        source:
+          - project4.orders
+        detail-type:
+          - OrderCreated
+      Targets:
+        - Id: FulfilmentQueue
+          Arn: !GetAtt FulfilmentQueue.Arn
+
+  # ---------------------------------------------------------------------------
   # COMPUTE
   # ---------------------------------------------------------------------------
 
@@ -295,6 +378,36 @@ Resources:
       Principal: apigateway.amazonaws.com
       # Only this API's POST /orders route may invoke it - not any API in the account
       SourceArn: !Join ["", ["arn:aws:execute-api:", !Ref "AWS::Region", ":", !Ref "AWS::AccountId", ":", !Ref OrdersApi, "/*/POST/orders"]]
+
+  # Consumes the fulfilment queue: records each new order as awaiting shipment.
+  FulfilOrderFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: project4-fulfil-order
+      Description: Reads OrderCreated messages from SQS and records them for fulfilment
+      CodeUri: src/fulfil-order/
+      Handler: index.handler
+      Tracing: Active
+      Environment:
+        Variables:
+          FULFILMENTS_TABLE_NAME: !Ref FulfilmentsTable
+      Policies:
+        - DynamoDBWritePolicy:          # write-only, Fulfilments table only
+            TableName: !Ref FulfilmentsTable
+        # (No SQS policy needed here: SAM automatically grants permission to
+        #  read and delete messages from the queue named in the event below.)
+      Events:
+        # Creates an "event source mapping": Lambda's own service polls the
+        # queue and invokes this function with batches of messages.
+        FulfilmentQueueEvent:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt FulfilmentQueue.Arn
+            BatchSize: 10               # up to 10 messages per invocation
+            FunctionResponseTypes:
+              # Lets the function report WHICH messages in a batch failed, so only
+              # those are retried - not the whole batch of 10.
+              - ReportBatchItemFailures
 
   # ---------------------------------------------------------------------------
   # MONITORING
@@ -347,3 +460,11 @@ Outputs:
     Value: !GetAtt OrdersEventBus.Arn
   OrderEventsLogGroupName:
     Value: !Ref OrderEventsLogGroup
+  FulfilmentQueueUrl:
+    Value: !Ref FulfilmentQueue
+  FulfilmentQueueArn:
+    Value: !GetAtt FulfilmentQueue.Arn
+  FulfilmentsTableName:
+    Value: !Ref FulfilmentsTable
+  FulfilOrderFunctionArn:
+    Value: !GetAtt FulfilOrderFunction.Arn
