@@ -8,6 +8,8 @@
 #     -> SNS topic -> email notification
 #     -> CloudWatch Logs (debug copy of every event)
 #   GET /orders/{id} -> API Gateway -> DynamoDB directly (no Lambda)
+# Monitoring: CloudWatch dashboard + alarms (emailed via an alerts topic),
+#             X-Ray tracing on the API and both Lambdas
 # =============================================================================
 AWSTemplateFormatVersion: '2010-09-09'
 Transform: AWS::Serverless-2016-10-31   # makes this a SAM template (enables AWS::Serverless::* shorthand)
@@ -20,7 +22,7 @@ Parameters:
   NotificationEmail:
     Type: String
     NoEcho: true                        # CloudFormation shows *** instead of the value in the console/API
-    Description: Email address that receives new-order notifications
+    Description: Email address that receives order notifications and alarm alerts
     AllowedPattern: '^[^@\s]+@[^@\s]+\.[^@\s]+$'   # basic email shape check - fails fast if the secret is missing
     ConstraintDescription: must be a valid email address
 
@@ -144,6 +146,7 @@ Resources:
     Properties:
       Name: project4-orders-api
       StageName: prod                   # becomes the /prod part of the URL
+      TracingEnabled: true              # X-Ray: traces start at the API, so one trace covers the whole request
       Auth:
         DefaultAuthorizer: CognitoAuthorizer   # every route needs a valid Cognito token
         Authorizers:
@@ -498,31 +501,330 @@ Resources:
               - ReportBatchItemFailures
 
   # ---------------------------------------------------------------------------
-  # MONITORING
+  # ALERTING (Exercise 4)
+  # Alarms watch metrics for us and email the alerts topic when something breaks.
+  # Common settings on every alarm below:
+  #   Period 60 + EvaluationPeriods 1 -> judge each 1-minute window on its own
+  #   TreatMissingData: notBreaching  -> NO data means "nothing happened", which
+  #     is fine. Many of these metrics only appear when there's activity, so
+  #     without this the alarms would sit in INSUFFICIENT_DATA most of the time.
+  #   OKActions -> also email when the alarm recovers, so you know it's resolved
   # ---------------------------------------------------------------------------
 
-  # Dashboard: API traffic + client errors, and Lambda invocations + errors.
-  # The body is JSON built with !Join so the region and function name can be inserted.
+  # Separate topic for engineering alerts - a different audience from order
+  # notifications. No topic policy needed: CloudWatch alarms in the same
+  # account can publish with the topic's default policy.
+  AlertsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: project4-alerts
+      DisplayName: Project4 Alerts
+      Tags:
+        - Key: Project
+          Value: project4-event-driven
+
+  # Needs confirming by email, just like the order notifications subscription
+  AlertsEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref AlertsTopic
+      Protocol: email
+      Endpoint: !Ref NotificationEmail
+
+  # Any CreateOrder error = customers may be failing to place orders
+  CreateOrderErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: project4-create-order-errors
+      AlarmDescription: CreateOrder Lambda is throwing errors - orders may be failing
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref CreateOrderFunction
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold   # alarm on ANY error
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlertsTopic
+      OKActions:
+        - !Ref AlertsTopic
+
+  # Any FulfilOrder error = orders are being retried and may not be fulfilled
+  FulfilOrderErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: project4-fulfil-order-errors
+      AlarmDescription: FulfilOrder Lambda is throwing errors - fulfilment is being retried
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref FulfilOrderFunction
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlertsTopic
+      OKActions:
+        - !Ref AlertsTopic
+
+  # 5XX = OUR fault (server-side). 4XX (bad input, no token) is the caller's
+  # fault, so it's shown on the dashboard but deliberately NOT alarmed on.
+  Api5xxErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: project4-api-5xx-errors
+      AlarmDescription: The orders API is returning server errors (5XX)
+      Namespace: AWS/ApiGateway
+      MetricName: 5XXError
+      Dimensions:
+        - Name: ApiName
+          Value: project4-orders-api
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlertsTopic
+      OKActions:
+        - !Ref AlertsTopic
+
+  # EventBridge matched an event but couldn't deliver it to the queue
+  # (e.g. a broken queue policy). Events can be lost silently without this.
+  FulfilmentRuleFailedInvocationsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: project4-fulfilment-rule-failed-invocations
+      AlarmDescription: EventBridge failed to deliver OrderCreated events to the fulfilment queue
+      Namespace: AWS/Events
+      MetricName: FailedInvocations
+      Dimensions:                       # rules on custom buses are identified by bus + rule name
+        - Name: EventBusName
+          Value: !Ref OrdersEventBus
+        - Name: RuleName
+          Value: project4-order-created-to-fulfilment
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlertsTopic
+      OKActions:
+        - !Ref AlertsTopic
+
+  # Same check for the notification rule -> SNS topic
+  NotificationRuleFailedInvocationsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: project4-notification-rule-failed-invocations
+      AlarmDescription: EventBridge failed to deliver OrderCreated events to the notifications topic
+      Namespace: AWS/Events
+      MetricName: FailedInvocations
+      Dimensions:
+        - Name: EventBusName
+          Value: !Ref OrdersEventBus
+        - Name: RuleName
+          Value: project4-order-created-to-notification
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlertsTopic
+      OKActions:
+        - !Ref AlertsTopic
+
+  # SNS accepted the message but couldn't deliver it to a subscriber
+  NotificationsFailedAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: project4-notifications-failed
+      AlarmDescription: SNS failed to deliver order notifications to subscribers
+      Namespace: AWS/SNS
+      MetricName: NumberOfNotificationsFailed
+      Dimensions:
+        - Name: TopicName
+          Value: !GetAtt OrderNotificationsTopic.TopicName
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlertsTopic
+      OKActions:
+        - !Ref AlertsTopic
+
+  # Backlog check: if the oldest message has waited over 5 minutes, FulfilOrder
+  # isn't keeping up (or is failing). Age is a better signal than message count:
+  # 100 messages that clear in seconds is fine; 1 message stuck for an hour isn't.
+  FulfilmentQueueBacklogAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: project4-fulfilment-queue-backlog
+      AlarmDescription: Messages are waiting more than 5 minutes in the fulfilment queue
+      Namespace: AWS/SQS
+      MetricName: ApproximateAgeOfOldestMessage
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt FulfilmentQueue.QueueName
+      Statistic: Maximum                # the single oldest message, not an average
+      Period: 300                       # 5-minute windows - SQS reports these metrics every few minutes
+      EvaluationPeriods: 1
+      Threshold: 300                    # seconds
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlertsTopic
+      OKActions:
+        - !Ref AlertsTopic
+
+  # ---------------------------------------------------------------------------
+  # MONITORING (Exercise 4)
+  # Dashboard laid out in the order an order travels:
+  #   Row 0: alarm status (red/green at a glance)
+  #   Row 1: API Gateway -> CreateOrder -> FulfilOrder
+  #   Row 2: EventBridge matched / failed / DLQ, and SQS throughput
+  #   Row 3: SQS backlog, and SNS delivery
+  # The body is JSON inside !Sub, so ${...} inserts names and ARNs. (Comments
+  # can't go inside the JSON block - they'd become part of it and break it.)
+  # Rule names are written out because !Ref on a rule on a custom bus returns
+  # "bus-name|rule-name", not just the rule name.
+  # ---------------------------------------------------------------------------
   OrdersDashboard:
     Type: AWS::CloudWatch::Dashboard
     Properties:
       DashboardName: project4-orders-dashboard
-      DashboardBody: !Join
-        - ""
-        - - '{"widgets":['
-          # Widget 1 (left): API Gateway request count and 4XX errors
-          - '{"type":"metric","x":0,"y":0,"width":12,"height":6,"properties":{"title":"API Gateway - Requests and 4XX Errors","region":"'
-          - !Ref "AWS::Region"
-          - '","stat":"Sum","period":60,"view":"timeSeries","metrics":[["AWS/ApiGateway","Count","ApiName","project4-orders-api"],["AWS/ApiGateway","4XXError","ApiName","project4-orders-api"]]}},'
-          # Widget 2 (right): Lambda invocations and errors
-          - '{"type":"metric","x":12,"y":0,"width":12,"height":6,"properties":{"title":"Lambda - Invocations and Errors","region":"'
-          - !Ref "AWS::Region"
-          - '","stat":"Sum","period":60,"view":"timeSeries","metrics":[["AWS/Lambda","Invocations","FunctionName","'
-          - !Ref CreateOrderFunction
-          - '"],["AWS/Lambda","Errors","FunctionName","'
-          - !Ref CreateOrderFunction
-          - '"]]}}'
-          - ']}'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "alarm", "x": 0, "y": 0, "width": 24, "height": 3,
+              "properties": {
+                "title": "Alarms",
+                "alarms": [
+                  "${CreateOrderErrorsAlarm.Arn}",
+                  "${FulfilOrderErrorsAlarm.Arn}",
+                  "${Api5xxErrorsAlarm.Arn}",
+                  "${FulfilmentRuleFailedInvocationsAlarm.Arn}",
+                  "${NotificationRuleFailedInvocationsAlarm.Arn}",
+                  "${NotificationsFailedAlarm.Arn}",
+                  "${FulfilmentQueueBacklogAlarm.Arn}"
+                ]
+              }
+            },
+            {
+              "type": "metric", "x": 0, "y": 3, "width": 8, "height": 6,
+              "properties": {
+                "title": "1. API Gateway - requests and errors",
+                "region": "${AWS::Region}", "stat": "Sum", "period": 60, "view": "timeSeries",
+                "metrics": [
+                  ["AWS/ApiGateway", "Count", "ApiName", "project4-orders-api"],
+                  ["AWS/ApiGateway", "4XXError", "ApiName", "project4-orders-api"],
+                  ["AWS/ApiGateway", "5XXError", "ApiName", "project4-orders-api"]
+                ]
+              }
+            },
+            {
+              "type": "metric", "x": 8, "y": 3, "width": 8, "height": 6,
+              "properties": {
+                "title": "2. CreateOrder Lambda",
+                "region": "${AWS::Region}", "stat": "Sum", "period": 60, "view": "timeSeries",
+                "metrics": [
+                  ["AWS/Lambda", "Invocations", "FunctionName", "${CreateOrderFunction}"],
+                  ["AWS/Lambda", "Errors", "FunctionName", "${CreateOrderFunction}"],
+                  ["AWS/Lambda", "Throttles", "FunctionName", "${CreateOrderFunction}"]
+                ]
+              }
+            },
+            {
+              "type": "metric", "x": 16, "y": 3, "width": 8, "height": 6,
+              "properties": {
+                "title": "5. FulfilOrder Lambda",
+                "region": "${AWS::Region}", "stat": "Sum", "period": 60, "view": "timeSeries",
+                "metrics": [
+                  ["AWS/Lambda", "Invocations", "FunctionName", "${FulfilOrderFunction}"],
+                  ["AWS/Lambda", "Errors", "FunctionName", "${FulfilOrderFunction}"],
+                  ["AWS/Lambda", "Throttles", "FunctionName", "${FulfilOrderFunction}"]
+                ]
+              }
+            },
+            {
+              "type": "metric", "x": 0, "y": 9, "width": 8, "height": 6,
+              "properties": {
+                "title": "3. EventBridge - MatchedEvents per rule",
+                "region": "${AWS::Region}", "stat": "Sum", "period": 60, "view": "timeSeries",
+                "metrics": [
+                  ["AWS/Events", "MatchedEvents", "EventBusName", "${OrdersEventBus}", "RuleName", "project4-order-created-to-fulfilment"],
+                  ["AWS/Events", "MatchedEvents", "EventBusName", "${OrdersEventBus}", "RuleName", "project4-order-created-to-notification"],
+                  ["AWS/Events", "MatchedEvents", "EventBusName", "${OrdersEventBus}", "RuleName", "project4-log-all-order-events"]
+                ]
+              }
+            },
+            {
+              "type": "metric", "x": 8, "y": 9, "width": 8, "height": 6,
+              "properties": {
+                "title": "3. EventBridge - FailedInvocations and DeadLetterInvocations",
+                "region": "${AWS::Region}", "stat": "Sum", "period": 60, "view": "timeSeries",
+                "metrics": [
+                  ["AWS/Events", "FailedInvocations", "EventBusName", "${OrdersEventBus}", "RuleName", "project4-order-created-to-fulfilment"],
+                  ["AWS/Events", "FailedInvocations", "EventBusName", "${OrdersEventBus}", "RuleName", "project4-order-created-to-notification"],
+                  ["AWS/Events", "DeadLetterInvocations", "EventBusName", "${OrdersEventBus}", "RuleName", "project4-order-created-to-fulfilment"],
+                  ["AWS/Events", "DeadLetterInvocations", "EventBusName", "${OrdersEventBus}", "RuleName", "project4-order-created-to-notification"]
+                ]
+              }
+            },
+            {
+              "type": "metric", "x": 16, "y": 9, "width": 8, "height": 6,
+              "properties": {
+                "title": "4. SQS - messages in and out",
+                "region": "${AWS::Region}", "stat": "Sum", "period": 60, "view": "timeSeries",
+                "metrics": [
+                  ["AWS/SQS", "NumberOfMessagesSent", "QueueName", "${FulfilmentQueue.QueueName}"],
+                  ["AWS/SQS", "NumberOfMessagesReceived", "QueueName", "${FulfilmentQueue.QueueName}"],
+                  ["AWS/SQS", "NumberOfMessagesDeleted", "QueueName", "${FulfilmentQueue.QueueName}"]
+                ]
+              }
+            },
+            {
+              "type": "metric", "x": 0, "y": 15, "width": 12, "height": 6,
+              "properties": {
+                "title": "4. SQS - backlog (messages waiting, age of oldest)",
+                "region": "${AWS::Region}", "period": 60, "view": "timeSeries",
+                "metrics": [
+                  ["AWS/SQS", "ApproximateNumberOfMessagesVisible", "QueueName", "${FulfilmentQueue.QueueName}", {"stat": "Maximum"}],
+                  ["AWS/SQS", "ApproximateAgeOfOldestMessage", "QueueName", "${FulfilmentQueue.QueueName}", {"stat": "Maximum", "yAxis": "right"}]
+                ]
+              }
+            },
+            {
+              "type": "metric", "x": 12, "y": 15, "width": 12, "height": 6,
+              "properties": {
+                "title": "SNS - order notifications",
+                "region": "${AWS::Region}", "stat": "Sum", "period": 60, "view": "timeSeries",
+                "metrics": [
+                  ["AWS/SNS", "NumberOfMessagesPublished", "TopicName", "${OrderNotificationsTopic.TopicName}"],
+                  ["AWS/SNS", "NumberOfNotificationsDelivered", "TopicName", "${OrderNotificationsTopic.TopicName}"],
+                  ["AWS/SNS", "NumberOfNotificationsFailed", "TopicName", "${OrderNotificationsTopic.TopicName}"]
+                ]
+              }
+            }
+          ]
+        }
 
 # Values published on the stack - shown by "aws cloudformation describe-stacks"
 Outputs:
@@ -558,3 +860,5 @@ Outputs:
     Value: !GetAtt FulfilOrderFunction.Arn
   OrderNotificationsTopicArn:
     Value: !Ref OrderNotificationsTopic
+  AlertsTopicArn:
+    Value: !Ref AlertsTopic
