@@ -1,52 +1,560 @@
-name: Deploy SAM application
+# =============================================================================
+# Project 4 - Event-Driven Orders Application
+# Built on Project 3's orders API. Flow so far:
+#   POST /orders -> API Gateway (Cognito auth) -> CreateOrder Lambda
+#                -> DynamoDB Orders table -> EventBridge (OrderCreated event)
+#   OrderCreated fans out to three independent consumers:
+#     -> SQS queue -> FulfilOrder Lambda -> DynamoDB Fulfilments table
+#     -> SNS topic -> email notification
+#     -> CloudWatch Logs (debug copy of every event)
+#   GET /orders/{id} -> API Gateway -> DynamoDB directly (no Lambda)
+# =============================================================================
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31   # makes this a SAM template (enables AWS::Serverless::* shorthand)
+Description: Project 4 - Event-Driven Orders Application
 
-on:
-  push:
-    branches: [main]
-  pull_request:
-    branches: [main]
+# Values supplied at deploy time instead of being written into the template.
+# The pipeline passes NotificationEmail from a GitHub secret, so the address
+# never appears in this public repo.
+Parameters:
+  NotificationEmail:
+    Type: String
+    NoEcho: true                        # CloudFormation shows *** instead of the value in the console/API
+    Description: Email address that receives new-order notifications
+    AllowedPattern: '^[^@\s]+@[^@\s]+\.[^@\s]+$'   # basic email shape check - fails fast if the secret is missing
+    ConstraintDescription: must be a valid email address
 
-permissions:
-  id-token: write
-  contents: read
+# Settings applied to every function/API in this template, so they aren't repeated
+Globals:
+  Function:
+    Runtime: nodejs22.x       # Node.js version Lambda runs the code on
+    Architectures:
+      - arm64                 # Graviton processors: ~20% cheaper than x86 for the same work
+    MemorySize: 256           # MB; CPU is allocated in proportion to memory
+    Timeout: 10               # seconds before Lambda kills a stuck invocation
+    Tags:
+      Project: project4-event-driven
+  Api:
+    OpenApiVersion: '3.0.1'   # stops SAM creating an extra unused "Stage" stage
 
-jobs:
-  validate:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
+Resources:
 
-      - uses: aws-actions/setup-sam@v2
-        with:
-          use-installer: true
+  # ---------------------------------------------------------------------------
+  # DATA
+  # ---------------------------------------------------------------------------
 
-      - name: Lint template
-        run: sam validate --lint
+  # Stores orders. One row per item: orderId groups an order's rows, itemId tells them apart.
+  # Regular single-region table - multi-region returns in the Global Endpoints exercise.
+  OrdersTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: project4-orders
+      BillingMode: PAY_PER_REQUEST      # on-demand: pay per request, no capacity planning
+      AttributeDefinitions:             # only key attributes are declared; others are schemaless
+        - AttributeName: orderId
+          AttributeType: S              # S = string
+        - AttributeName: itemId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: orderId
+          KeyType: HASH                 # partition key: decides which partition stores the row
+        - AttributeName: itemId
+          KeyType: RANGE                # sort key: orders rows within the same orderId
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true   # restore the table to any second in the last 35 days
+      Tags:
+        - Key: Project
+          Value: project4-event-driven
 
-  deploy:
-    needs: validate
-    if: github.event_name == 'push'
-    runs-on: ubuntu-latest
-    concurrency: deploy-production
-    steps:
-      - uses: actions/checkout@v4
+  # ---------------------------------------------------------------------------
+  # AUTHENTICATION
+  # ---------------------------------------------------------------------------
 
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
+  # The user directory. API callers must log in here to get a token.
+  OrdersUserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: project4-orders-users
+      UsernameAttributes:
+        - email                         # users log in with their email address
+      AutoVerifiedAttributes:
+        - email
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 12
+          RequireUppercase: true
+          RequireLowercase: true
+          RequireNumbers: true
+          RequireSymbols: true
+      AccountRecoverySetting:
+        RecoveryMechanisms:
+          - Name: verified_email        # password resets go to the verified email
+            Priority: 1
+      UserPoolTags:
+        Project: project4-event-driven
 
-      - uses: aws-actions/setup-sam@v2
-        with:
-          use-installer: true
+  # The "app" allowed to log users in. Its ID is used by initiate-auth.
+  OrdersUserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: project4-orders-client
+      UserPoolId: !Ref OrdersUserPool
+      GenerateSecret: false             # public client (CLI/browser) - a secret couldn't be kept safe
+      ExplicitAuthFlows:
+        - ALLOW_USER_PASSWORD_AUTH      # log in with username + password (what our curl tests use)
+        - ALLOW_REFRESH_TOKEN_AUTH      # swap a refresh token for new tokens without a password
+      PreventUserExistenceErrors: ENABLED   # same error for "wrong password" and "no such user"
+      IdTokenValidity: 60
+      AccessTokenValidity: 60
+      TokenValidityUnits:
+        IdToken: minutes                # tokens expire after 60 minutes
+        AccessToken: minutes
 
-      - name: Configure AWS credentials (OIDC)
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
-          aws-region: eu-west-2
+  # ---------------------------------------------------------------------------
+  # API
+  # ---------------------------------------------------------------------------
 
-      - name: Build
-        run: sam build
+  # Role API Gateway assumes for GET /orders/{id}, so it can query DynamoDB itself.
+  # Least privilege: Query only, on this table only.
+  ApiGatewayDynamoDBReadRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:         # trust policy: WHO can use this role (API Gateway)
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: apigateway.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:                         # permissions: WHAT the role can do
+        - PolicyName: QueryOrdersTable
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: dynamodb:Query
+                Resource: !GetAtt OrdersTable.Arn
+      Tags:
+        - Key: Project
+          Value: project4-event-driven
 
-      - name: Deploy
-        run: sam deploy --no-confirm-changeset --no-fail-on-empty-changeset
+  # The REST API. Routes are defined in OpenAPI format inside DefinitionBody.
+  OrdersApi:
+    Type: AWS::Serverless::Api
+    Properties:
+      Name: project4-orders-api
+      StageName: prod                   # becomes the /prod part of the URL
+      Auth:
+        DefaultAuthorizer: CognitoAuthorizer   # every route needs a valid Cognito token
+        Authorizers:
+          CognitoAuthorizer:
+            UserPoolArn: !GetAtt OrdersUserPool.Arn
+      DefinitionBody:
+        openapi: '3.0.1'
+        info:
+          title: project4-orders-api
+          version: '1.0'
+        paths:
+          # POST /orders -> CreateOrder Lambda
+          /orders:
+            post:
+              summary: Create an order (Lambda proxy integration)
+              security:
+                - CognitoAuthorizer: []
+              responses:
+                '201':
+                  description: Order created
+              x-amazon-apigateway-integration:
+                type: aws_proxy           # proxy: the whole request is passed to the Lambda as-is
+                httpMethod: POST          # API Gateway always calls Lambda with POST
+                uri: !Join ["", ["arn:aws:apigateway:", !Ref "AWS::Region", ":lambda:path/2015-03-31/functions/", !GetAtt CreateOrderFunction.Arn, "/invocations"]]
+          # GET /orders/{orderId} -> DynamoDB Query directly, no Lambda
+          /orders/{orderId}:
+            get:
+              summary: Get an order directly from DynamoDB (no Lambda)
+              parameters:
+                - name: orderId
+                  in: path
+                  required: true
+                  schema:
+                    type: string
+              security:
+                - CognitoAuthorizer: []
+              responses:
+                '200':
+                  description: The order
+                '404':
+                  description: Order not found
+              x-amazon-apigateway-integration:
+                type: aws                 # non-proxy: we translate request/response with templates
+                httpMethod: POST          # DynamoDB's API is always called with POST
+                uri: !Join ["", ["arn:aws:apigateway:", !Ref "AWS::Region", ":dynamodb:action/Query"]]
+                credentials: !GetAtt ApiGatewayDynamoDBReadRole.Arn
+                passthroughBehavior: never
+                # Request template: turns the URL's orderId into a DynamoDB Query.
+                # The table name is hard-coded because this is VTL text, not a CloudFormation
+                # property - keep it in sync with OrdersTable.TableName.
+                requestTemplates:
+                  application/json: |
+                    {
+                      "TableName": "project4-orders",
+                      "KeyConditionExpression": "orderId = :o",
+                      "ExpressionAttributeValues": {
+                        ":o": {"S": "$util.escapeJavaScript($input.params('orderId'))"}
+                      }
+                    }
+                # Response template: reshapes DynamoDB's typed JSON ({"S": "..."}) into
+                # clean JSON, and returns 404 when no rows were found.
+                responses:
+                  default:
+                    statusCode: '200'
+                    responseTemplates:
+                      application/json: |
+                        #set($inputRoot = $input.path('$'))
+                        #if($inputRoot.Count == 0)
+                        #set($context.responseOverride.status = 404)
+                        {"message": "Order not found"}
+                        #else
+                        {
+                          "orderId": "$inputRoot.Items[0].orderId.S",
+                          "customerId": "$inputRoot.Items[0].customerId.S",
+                          "createdAt": "$inputRoot.Items[0].createdAt.S",
+                          "items": [
+                        #foreach($item in $inputRoot.Items)
+                            {"itemId": "$item.itemId.S", "productId": "$item.productId.S", "quantity": $item.quantity.N, "price": $item.price.N}#if($foreach.hasNext),#end
+                        #end
+                          ]
+                        }
+                        #end
+      Tags:
+        Project: project4-event-driven
+
+  # ---------------------------------------------------------------------------
+  # EVENTS (Exercise 1)
+  # ---------------------------------------------------------------------------
+
+  # Custom event bus for this app. The account's "default" bus receives AWS
+  # service events; a custom bus keeps our order events separate, so our
+  # rules only ever see our events.
+  OrdersEventBus:
+    Type: AWS::Events::EventBus
+    Properties:
+      Name: project4-orders-bus
+      Tags:
+        - Key: Project
+          Value: project4-event-driven
+
+  # DEBUG: a bus with no rules silently discards events. This log group, plus
+  # the rule below, keeps a copy of every order event so we can see what's
+  # being published.
+  OrderEventsLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/events/project4-orders-bus   # must start with /aws/events/ for EventBridge
+      RetentionInDays: 7                              # auto-delete after a week, so costs stay at ~0
+
+  # Resource policy ON the log group, allowing EventBridge to write into it.
+  # Without this the rule still matches, but nothing arrives - and no error is shown.
+  OrderEventsLogGroupPolicy:
+    Type: AWS::Logs::ResourcePolicy
+    Properties:
+      PolicyName: project4-orders-bus-to-logs
+      PolicyDocument: !Sub '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":["events.amazonaws.com","delivery.logs.amazonaws.com"]},"Action":["logs:CreateLogStream","logs:PutLogEvents"],"Resource":"${OrderEventsLogGroup.Arn}"}]}'
+
+  # Rule: "any event from source project4.orders -> copy it to the log group"
+  LogAllOrderEventsRule:
+    Type: AWS::Events::Rule
+    DependsOn: OrderEventsLogGroupPolicy   # create the permission first, so no early events are dropped
+    Properties:
+      Name: project4-log-all-order-events
+      EventBusName: !Ref OrdersEventBus    # listen on our custom bus, not "default"
+      State: ENABLED
+      EventPattern:                        # which events match: only those with this source
+        source:
+          - project4.orders
+      Targets:
+        - Id: OrderEventsLogGroup
+          Arn: !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:${OrderEventsLogGroup}
+
+  # ---------------------------------------------------------------------------
+  # FULFILMENT (Exercise 2)
+  # OrderCreated -> rule -> FulfilmentQueue -> FulfilOrder Lambda -> FulfilmentsTable
+  # ---------------------------------------------------------------------------
+
+  # One row per order, recording its fulfilment status. Separate from the
+  # Orders table because it belongs to a different part of the business
+  # (the warehouse), which owns its own data.
+  FulfilmentsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: project4-fulfilments
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: orderId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: orderId
+          KeyType: HASH                 # one fulfilment per order, so no sort key needed
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      Tags:
+        - Key: Project
+          Value: project4-event-driven
+
+  # Buffer between EventBridge and FulfilOrder: absorbs spikes, keeps messages
+  # safe if the Lambda is failing, and retries them automatically.
+  FulfilmentQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: project4-fulfilment-queue
+      # How long a message is hidden from other consumers while Lambda works on it.
+      # AWS recommends at least 6x the function timeout (10s), so a slow attempt
+      # isn't handed to a second Lambda while the first is still running.
+      VisibilityTimeout: 60
+      MessageRetentionPeriod: 345600    # 4 days (in seconds) before an unprocessed message is deleted
+      SqsManagedSseEnabled: true        # encrypt messages at rest, using SQS-managed keys (free)
+      Tags:
+        - Key: Project
+          Value: project4-event-driven
+
+  # Resource policy ON the queue: lets EventBridge send messages into it, but
+  # ONLY from our fulfilment rule. Without this, the rule matches events but
+  # delivery silently fails.
+  FulfilmentQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues:
+        - !Ref FulfilmentQueue          # !Ref on a queue returns its URL
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sqs:SendMessage
+            Resource: !GetAtt FulfilmentQueue.Arn
+            Condition:
+              ArnEquals:
+                # Without this condition, ANY EventBridge rule in ANY account
+                # could push messages into the queue (the "confused deputy" problem)
+                aws:SourceArn: !GetAtt OrderCreatedToFulfilmentRule.Arn
+
+  # Rule: "OrderCreated events from our app -> the fulfilment queue".
+  # More specific than the debug rule: it also matches on detail-type, so
+  # future event types (e.g. OrderCancelled) won't be sent to fulfilment.
+  OrderCreatedToFulfilmentRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: project4-order-created-to-fulfilment
+      EventBusName: !Ref OrdersEventBus
+      State: ENABLED
+      EventPattern:
+        source:
+          - project4.orders
+        detail-type:
+          - OrderCreated
+      Targets:
+        - Id: FulfilmentQueue
+          Arn: !GetAtt FulfilmentQueue.Arn
+
+  # ---------------------------------------------------------------------------
+  # NOTIFICATIONS (Exercise 3)
+  # OrderCreated -> rule (reshapes the event into a readable sentence)
+  #              -> SNS topic -> email subscription
+  # ---------------------------------------------------------------------------
+
+  # Pub/sub topic: every message published here is PUSHED to all subscribers.
+  # Today that's one email address; SMS, HTTP endpoints or Lambdas could be
+  # added as subscribers later without changing anything else.
+  OrderNotificationsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: project4-order-notifications
+      DisplayName: Project4 Orders      # shown as the sender name on notification emails
+      Tags:
+        - Key: Project
+          Value: project4-event-driven
+
+  # Email subscriber. AWS sends a confirmation email first - nothing is
+  # delivered until the link in it is clicked (stops people being spammed
+  # by subscriptions they never agreed to).
+  OrderNotificationsEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref OrderNotificationsTopic   # !Ref on an SNS topic returns its ARN
+      Protocol: email
+      Endpoint: !Ref NotificationEmail         # from the Parameters section (GitHub secret)
+
+  # Resource policy ON the topic: lets EventBridge publish to it, but ONLY
+  # from our notification rule. Same pattern as the SQS queue policy.
+  OrderNotificationsTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics:
+        - !Ref OrderNotificationsTopic
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sns:Publish
+            Resource: !Ref OrderNotificationsTopic
+            Condition:
+              ArnEquals:
+                aws:SourceArn: !GetAtt OrderCreatedToNotificationRule.Arn
+
+  # Rule: "OrderCreated -> SNS topic", with an INPUT TRANSFORMER.
+  # Without the transformer, the email body would be the raw event JSON.
+  # The transformer picks fields out of the event (InputPathsMap) and drops
+  # them into a sentence (InputTemplate) - no Lambda needed to format it.
+  OrderCreatedToNotificationRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: project4-order-created-to-notification
+      EventBusName: !Ref OrdersEventBus
+      State: ENABLED
+      EventPattern:
+        source:
+          - project4.orders
+        detail-type:
+          - OrderCreated
+      Targets:
+        - Id: OrderNotificationsTopic
+          Arn: !Ref OrderNotificationsTopic
+          InputTransformer:
+            InputPathsMap:                  # name: JSON path into the event
+              orderId: $.detail.orderId
+              customerId: $.detail.customerId
+              itemCount: $.detail.itemCount
+              createdAt: $.detail.createdAt
+            # <name> placeholders are replaced with the values above. The outer
+            # single quotes are YAML; the inner double quotes make it a JSON string.
+            InputTemplate: '"New order <orderId> from customer <customerId>: <itemCount> item(s), placed at <createdAt>."'
+
+  # ---------------------------------------------------------------------------
+  # COMPUTE
+  # ---------------------------------------------------------------------------
+
+  # Handles POST /orders: validates the order, saves it to DynamoDB, then
+  # announces it by publishing an OrderCreated event to the bus.
+  CreateOrderFunction:
+    Type: AWS::Serverless::Function     # SAM shorthand: expands into a Lambda function plus its IAM role
+    Properties:
+      FunctionName: project4-create-order
+      Description: Saves a new order and publishes an OrderCreated event
+      CodeUri: src/create-order/        # folder SAM packages and uploads as the function's code
+      Handler: index.handler            # file "index", exported function "handler"
+      Tracing: Active                   # X-Ray traces: see each call this function makes and how long it takes
+      Environment:
+        Variables:                      # read in code via process.env, so nothing is hard-coded
+          TABLE_NAME: !Ref OrdersTable          # !Ref on a table returns its name
+          EVENT_BUS_NAME: !Ref OrdersEventBus   # !Ref on an event bus returns its name
+      Policies:                         # SAM builds the function's IAM role from these
+        - DynamoDBWritePolicy:          # write-only, this table only
+            TableName: !Ref OrdersTable
+        - EventBridgePutEventsPolicy:   # events:PutEvents on this bus only - least privilege
+            EventBusName: !Ref OrdersEventBus
+
+  # Lets API Gateway invoke the Lambda. Needed because the POST route is defined
+  # in DefinitionBody rather than in the function's Events block (where SAM would add it).
+  CreateOrderApiPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref CreateOrderFunction
+      Principal: apigateway.amazonaws.com
+      # Only this API's POST /orders route may invoke it - not any API in the account
+      SourceArn: !Join ["", ["arn:aws:execute-api:", !Ref "AWS::Region", ":", !Ref "AWS::AccountId", ":", !Ref OrdersApi, "/*/POST/orders"]]
+
+  # Consumes the fulfilment queue: records each new order as awaiting shipment.
+  FulfilOrderFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: project4-fulfil-order
+      Description: Reads OrderCreated messages from SQS and records them for fulfilment
+      CodeUri: src/fulfil-order/
+      Handler: index.handler
+      Tracing: Active
+      Environment:
+        Variables:
+          FULFILMENTS_TABLE_NAME: !Ref FulfilmentsTable
+      Policies:
+        - DynamoDBWritePolicy:          # write-only, Fulfilments table only
+            TableName: !Ref FulfilmentsTable
+        # (No SQS policy needed here: SAM automatically grants permission to
+        #  read and delete messages from the queue named in the event below.)
+      Events:
+        # Creates an "event source mapping": Lambda's own service polls the
+        # queue and invokes this function with batches of messages.
+        FulfilmentQueueEvent:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt FulfilmentQueue.Arn
+            BatchSize: 10               # up to 10 messages per invocation
+            FunctionResponseTypes:
+              # Lets the function report WHICH messages in a batch failed, so only
+              # those are retried - not the whole batch of 10.
+              - ReportBatchItemFailures
+
+  # ---------------------------------------------------------------------------
+  # MONITORING
+  # ---------------------------------------------------------------------------
+
+  # Dashboard: API traffic + client errors, and Lambda invocations + errors.
+  # The body is JSON built with !Join so the region and function name can be inserted.
+  OrdersDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: project4-orders-dashboard
+      DashboardBody: !Join
+        - ""
+        - - '{"widgets":['
+          # Widget 1 (left): API Gateway request count and 4XX errors
+          - '{"type":"metric","x":0,"y":0,"width":12,"height":6,"properties":{"title":"API Gateway - Requests and 4XX Errors","region":"'
+          - !Ref "AWS::Region"
+          - '","stat":"Sum","period":60,"view":"timeSeries","metrics":[["AWS/ApiGateway","Count","ApiName","project4-orders-api"],["AWS/ApiGateway","4XXError","ApiName","project4-orders-api"]]}},'
+          # Widget 2 (right): Lambda invocations and errors
+          - '{"type":"metric","x":12,"y":0,"width":12,"height":6,"properties":{"title":"Lambda - Invocations and Errors","region":"'
+          - !Ref "AWS::Region"
+          - '","stat":"Sum","period":60,"view":"timeSeries","metrics":[["AWS/Lambda","Invocations","FunctionName","'
+          - !Ref CreateOrderFunction
+          - '"],["AWS/Lambda","Errors","FunctionName","'
+          - !Ref CreateOrderFunction
+          - '"]]}}'
+          - ']}'
+
+# Values published on the stack - shown by "aws cloudformation describe-stacks"
+Outputs:
+  OrdersTableName:
+    Value: !Ref OrdersTable
+  OrdersTableArn:
+    Value: !GetAtt OrdersTable.Arn
+  CreateOrderFunctionArn:
+    Value: !GetAtt CreateOrderFunction.Arn
+  OrdersApiUrl:
+    Description: POST orders to this URL
+    Value: !Join ["", ["https://", !Ref OrdersApi, ".execute-api.", !Ref "AWS::Region", ".amazonaws.com/prod/orders"]]
+  UserPoolId:
+    Value: !Ref OrdersUserPool
+  UserPoolClientId:
+    Value: !Ref OrdersUserPoolClient
+  DashboardUrl:
+    Description: Open this to see the dashboard
+    Value: !Join ["", ["https://", !Ref "AWS::Region", ".console.aws.amazon.com/cloudwatch/home?region=", !Ref "AWS::Region", "#dashboards:name=project4-orders-dashboard"]]
+  OrdersEventBusName:
+    Value: !Ref OrdersEventBus
+  OrdersEventBusArn:
+    Value: !GetAtt OrdersEventBus.Arn
+  OrderEventsLogGroupName:
+    Value: !Ref OrderEventsLogGroup
+  FulfilmentQueueUrl:
+    Value: !Ref FulfilmentQueue
+  FulfilmentQueueArn:
+    Value: !GetAtt FulfilmentQueue.Arn
+  FulfilmentsTableName:
+    Value: !Ref FulfilmentsTable
+  FulfilOrderFunctionArn:
+    Value: !GetAtt FulfilOrderFunction.Arn
+  OrderNotificationsTopicArn:
+    Value: !Ref OrderNotificationsTopic
