@@ -3,13 +3,26 @@
 # Built on Project 3's orders API. Flow so far:
 #   POST /orders -> API Gateway (Cognito auth) -> CreateOrder Lambda
 #                -> DynamoDB Orders table -> EventBridge (OrderCreated event)
-#   OrderCreated -> EventBridge rule -> SQS queue -> FulfilOrder Lambda
-#                -> DynamoDB Fulfilments table
+#   OrderCreated fans out to three independent consumers:
+#     -> SQS queue -> FulfilOrder Lambda -> DynamoDB Fulfilments table
+#     -> SNS topic -> email notification
+#     -> CloudWatch Logs (debug copy of every event)
 #   GET /orders/{id} -> API Gateway -> DynamoDB directly (no Lambda)
 # =============================================================================
 AWSTemplateFormatVersion: '2010-09-09'
 Transform: AWS::Serverless-2016-10-31   # makes this a SAM template (enables AWS::Serverless::* shorthand)
 Description: Project 4 - Event-Driven Orders Application
+
+# Values supplied at deploy time instead of being written into the template.
+# The pipeline passes NotificationEmail from a GitHub secret, so the address
+# never appears in this public repo.
+Parameters:
+  NotificationEmail:
+    Type: String
+    NoEcho: true                        # CloudFormation shows *** instead of the value in the console/API
+    Description: Email address that receives new-order notifications
+    AllowedPattern: '^[^@\s]+@[^@\s]+\.[^@\s]+$'   # basic email shape check - fails fast if the secret is missing
+    ConstraintDescription: must be a valid email address
 
 # Settings applied to every function/API in this template, so they aren't repeated
 Globals:
@@ -345,6 +358,81 @@ Resources:
           Arn: !GetAtt FulfilmentQueue.Arn
 
   # ---------------------------------------------------------------------------
+  # NOTIFICATIONS (Exercise 3)
+  # OrderCreated -> rule (reshapes the event into a readable sentence)
+  #              -> SNS topic -> email subscription
+  # ---------------------------------------------------------------------------
+
+  # Pub/sub topic: every message published here is PUSHED to all subscribers.
+  # Today that's one email address; SMS, HTTP endpoints or Lambdas could be
+  # added as subscribers later without changing anything else.
+  OrderNotificationsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: project4-order-notifications
+      DisplayName: Project4 Orders      # shown as the sender name on notification emails
+      Tags:
+        - Key: Project
+          Value: project4-event-driven
+
+  # Email subscriber. AWS sends a confirmation email first - nothing is
+  # delivered until the link in it is clicked (stops people being spammed
+  # by subscriptions they never agreed to).
+  OrderNotificationsEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref OrderNotificationsTopic   # !Ref on an SNS topic returns its ARN
+      Protocol: email
+      Endpoint: !Ref NotificationEmail         # from the Parameters section (GitHub secret)
+
+  # Resource policy ON the topic: lets EventBridge publish to it, but ONLY
+  # from our notification rule. Same pattern as the SQS queue policy.
+  OrderNotificationsTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics:
+        - !Ref OrderNotificationsTopic
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sns:Publish
+            Resource: !Ref OrderNotificationsTopic
+            Condition:
+              ArnEquals:
+                aws:SourceArn: !GetAtt OrderCreatedToNotificationRule.Arn
+
+  # Rule: "OrderCreated -> SNS topic", with an INPUT TRANSFORMER.
+  # Without the transformer, the email body would be the raw event JSON.
+  # The transformer picks fields out of the event (InputPathsMap) and drops
+  # them into a sentence (InputTemplate) - no Lambda needed to format it.
+  OrderCreatedToNotificationRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: project4-order-created-to-notification
+      EventBusName: !Ref OrdersEventBus
+      State: ENABLED
+      EventPattern:
+        source:
+          - project4.orders
+        detail-type:
+          - OrderCreated
+      Targets:
+        - Id: OrderNotificationsTopic
+          Arn: !Ref OrderNotificationsTopic
+          InputTransformer:
+            InputPathsMap:                  # name: JSON path into the event
+              orderId: $.detail.orderId
+              customerId: $.detail.customerId
+              itemCount: $.detail.itemCount
+              createdAt: $.detail.createdAt
+            # <name> placeholders are replaced with the values above. The outer
+            # single quotes are YAML; the inner double quotes make it a JSON string.
+            InputTemplate: '"New order <orderId> from customer <customerId>: <itemCount> item(s), placed at <createdAt>."'
+
+  # ---------------------------------------------------------------------------
   # COMPUTE
   # ---------------------------------------------------------------------------
 
@@ -468,3 +556,5 @@ Outputs:
     Value: !Ref FulfilmentsTable
   FulfilOrderFunctionArn:
     Value: !GetAtt FulfilOrderFunction.Arn
+  OrderNotificationsTopicArn:
+    Value: !Ref OrderNotificationsTopic
