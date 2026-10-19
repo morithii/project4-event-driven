@@ -1,10 +1,12 @@
 # =============================================================================
 # Project 4 - Event-Driven Orders Application
-# Built on Project 3's orders API. Flow so far:
-#   POST /orders -> API Gateway (Cognito auth) -> CreateOrder Lambda
-#                -> DynamoDB Orders table -> EventBridge (OrderCreated event)
+# Flow:
+#   POST /orders -> API Gateway (Cognito auth + JSON Schema validation)
+#                -> SQS intake queue -> returns 202 Accepted immediately
+#   Intake queue -> CreateOrder Lambda -> DynamoDB Orders table
+#                -> EventBridge (OrderCreated event)
 #   OrderCreated fans out to three independent consumers:
-#     -> SQS queue -> FulfilOrder Lambda -> DynamoDB Fulfilments table
+#     -> SQS fulfilment queue -> FulfilOrder Lambda -> DynamoDB Fulfilments table
 #     -> SNS topic -> email notification
 #     -> CloudWatch Logs (debug copy of every event)
 #   GET /orders/{id} -> API Gateway -> DynamoDB directly (no Lambda)
@@ -113,6 +115,49 @@ Resources:
         AccessToken: minutes
 
   # ---------------------------------------------------------------------------
+  # ORDER INTAKE (Exercise 6)
+  # API Gateway writes new orders straight into this queue; CreateOrder
+  # consumes it. The API answers 202 without waiting for processing.
+  # ---------------------------------------------------------------------------
+
+  # Holds accepted orders until CreateOrder processes them. If CreateOrder or
+  # DynamoDB is having problems, orders wait here safely instead of failing.
+  OrderIntakeQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: project4-order-intake-queue
+      VisibilityTimeout: 60             # >= 6x the Lambda timeout (10s), so a slow attempt isn't duplicated
+      MessageRetentionPeriod: 345600    # 4 days
+      SqsManagedSseEnabled: true        # encrypted at rest
+      Tags:
+        - Key: Project
+          Value: project4-event-driven
+
+  # Role API Gateway assumes to put messages on the intake queue.
+  # Least privilege: SendMessage only, on this queue only.
+  ApiGatewaySqsSendRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: apigateway.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: SendToOrderIntakeQueue
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: sqs:SendMessage
+                Resource: !GetAtt OrderIntakeQueue.Arn
+      Tags:
+        - Key: Project
+          Value: project4-event-driven
+
+  # ---------------------------------------------------------------------------
   # API
   # ---------------------------------------------------------------------------
 
@@ -157,20 +202,76 @@ Resources:
         info:
           title: project4-orders-api
           version: '1.0'
+
+        # Validators available to methods. "body-only" checks the request body
+        # against the method's JSON Schema model; bad requests get a 400 and
+        # never reach the queue.
+        x-amazon-apigateway-request-validators:
+          body-only:
+            validateRequestBody: true
+            validateRequestParameters: false
+
+        # Custom error for failed validation. The default just says "Invalid
+        # request body"; this adds WHICH rule failed, so callers can fix it.
+        x-amazon-apigateway-gateway-responses:
+          BAD_REQUEST_BODY:
+            statusCode: 400
+            responseTemplates:
+              application/json: '{"message": "Invalid order", "details": "$context.error.validationErrorString"}'
+
         paths:
-          # POST /orders -> CreateOrder Lambda
+          # POST /orders -> validate -> SQS intake queue -> 202 Accepted
           /orders:
             post:
-              summary: Create an order (Lambda proxy integration)
+              summary: Accept an order for asynchronous processing
               security:
                 - CognitoAuthorizer: []
+              x-amazon-apigateway-request-validator: body-only
+              requestBody:
+                required: true
+                content:
+                  application/json:
+                    schema:
+                      $ref: '#/components/schemas/Order'
               responses:
-                '201':
-                  description: Order created
+                '202':
+                  description: Order accepted for processing
+                '400':
+                  description: Request body failed validation
+                '500':
+                  description: Order could not be queued
               x-amazon-apigateway-integration:
-                type: aws_proxy           # proxy: the whole request is passed to the Lambda as-is
-                httpMethod: POST          # API Gateway always calls Lambda with POST
-                uri: !Join ["", ["arn:aws:apigateway:", !Ref "AWS::Region", ":lambda:path/2015-03-31/functions/", !GetAtt CreateOrderFunction.Arn, "/invocations"]]
+                type: aws                 # direct AWS service integration - no Lambda
+                httpMethod: POST          # SQS's API is called with POST
+                # "sqs:path/<account>/<queue>" = call the SQS API for this queue
+                uri: !Sub arn:aws:apigateway:${AWS::Region}:sqs:path/${AWS::AccountId}/${OrderIntakeQueue.QueueName}
+                credentials: !GetAtt ApiGatewaySqsSendRole.Arn
+                passthroughBehavior: never   # reject content types we have no template for (415)
+                # SQS's API expects form-encoded parameters, not JSON
+                requestParameters:
+                  integration.request.header.Content-Type: "'application/x-www-form-urlencoded'"
+                # Builds the SendMessage call:
+                #   MessageBody   = the client's JSON, URL-encoded
+                #   orderId       = $context.requestId (unique ID API Gateway gives every request)
+                #   acceptedAt    = when API Gateway received it (epoch milliseconds)
+                # The IDs travel as MESSAGE ATTRIBUTES - metadata alongside the body.
+                requestTemplates:
+                  application/json: 'Action=SendMessage&MessageBody=$util.urlEncode($input.body)&MessageAttribute.1.Name=orderId&MessageAttribute.1.Value.DataType=String&MessageAttribute.1.Value.StringValue=$context.requestId&MessageAttribute.2.Name=acceptedAt&MessageAttribute.2.Value.DataType=Number&MessageAttribute.2.Value.StringValue=$context.requestTimeEpoch'
+                # Map SQS's reply to OUR response. Keys are patterns matched
+                # against SQS's HTTP status:
+                #   2xx     -> 202 with the orderId
+                #   default -> anything else (SQS error) -> 500, so failures aren't
+                #              hidden behind a fake "accepted"
+                responses:
+                  '2\d{2}':
+                    statusCode: '202'
+                    responseTemplates:
+                      application/json: '{"orderId": "$context.requestId", "status": "ACCEPTED", "message": "Order accepted for processing"}'
+                  default:
+                    statusCode: '500'
+                    responseTemplates:
+                      application/json: '{"message": "Could not accept order, please retry"}'
+
           # GET /orders/{orderId} -> DynamoDB Query directly, no Lambda
           /orders/{orderId}:
             get:
@@ -229,6 +330,43 @@ Resources:
                           ]
                         }
                         #end
+
+        # JSON Schema (draft 4) for a valid order. API Gateway enforces it
+        # before anything is queued - this replaces the validation that used
+        # to live at the top of the CreateOrder Lambda.
+        components:
+          schemas:
+            Order:
+              type: object
+              required:
+                - customerId
+                - items
+              additionalProperties: false   # reject unexpected fields
+              properties:
+                customerId:
+                  type: string
+                  minLength: 1
+                items:
+                  type: array
+                  minItems: 1
+                  maxItems: 100             # DynamoDB transactions allow at most 100 operations
+                  items:
+                    type: object
+                    required:
+                      - productId
+                      - quantity
+                      - price
+                    additionalProperties: false
+                    properties:
+                      productId:
+                        type: string
+                        minLength: 1
+                      quantity:
+                        type: integer
+                        minimum: 1
+                      price:
+                        type: number
+                        minimum: 0
       Tags:
         Project: project4-event-driven
 
@@ -439,13 +577,14 @@ Resources:
   # COMPUTE
   # ---------------------------------------------------------------------------
 
-  # Handles POST /orders: validates the order, saves it to DynamoDB, then
+  # Consumes the intake queue: saves each accepted order to DynamoDB, then
   # announces it by publishing an OrderCreated event to the bus.
+  # (No longer called by API Gateway - so CreateOrderApiPermission was removed.)
   CreateOrderFunction:
     Type: AWS::Serverless::Function     # SAM shorthand: expands into a Lambda function plus its IAM role
     Properties:
       FunctionName: project4-create-order
-      Description: Saves a new order and publishes an OrderCreated event
+      Description: Saves queued orders and publishes OrderCreated events
       CodeUri: src/create-order/        # folder SAM packages and uploads as the function's code
       Handler: index.handler            # file "index", exported function "handler"
       Tracing: Active                   # X-Ray traces: see each call this function makes and how long it takes
@@ -458,17 +597,15 @@ Resources:
             TableName: !Ref OrdersTable
         - EventBridgePutEventsPolicy:   # events:PutEvents on this bus only - least privilege
             EventBusName: !Ref OrdersEventBus
-
-  # Lets API Gateway invoke the Lambda. Needed because the POST route is defined
-  # in DefinitionBody rather than in the function's Events block (where SAM would add it).
-  CreateOrderApiPermission:
-    Type: AWS::Lambda::Permission
-    Properties:
-      Action: lambda:InvokeFunction
-      FunctionName: !Ref CreateOrderFunction
-      Principal: apigateway.amazonaws.com
-      # Only this API's POST /orders route may invoke it - not any API in the account
-      SourceArn: !Join ["", ["arn:aws:execute-api:", !Ref "AWS::Region", ":", !Ref "AWS::AccountId", ":", !Ref OrdersApi, "/*/POST/orders"]]
+      Events:
+        # Lambda polls the intake queue and invokes this function with batches
+        OrderIntakeQueueEvent:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt OrderIntakeQueue.Arn
+            BatchSize: 10
+            FunctionResponseTypes:
+              - ReportBatchItemFailures   # retry only the messages that failed
 
   # Consumes the fulfilment queue: records each new order as awaiting shipment.
   FulfilOrderFunction:
@@ -531,12 +668,12 @@ Resources:
       Protocol: email
       Endpoint: !Ref NotificationEmail
 
-  # Any CreateOrder error = customers may be failing to place orders
+  # Any CreateOrder error = accepted orders aren't being saved
   CreateOrderErrorsAlarm:
     Type: AWS::CloudWatch::Alarm
     Properties:
       AlarmName: project4-create-order-errors
-      AlarmDescription: CreateOrder Lambda is throwing errors - orders may be failing
+      AlarmDescription: CreateOrder Lambda is throwing errors - accepted orders may not be saved
       Namespace: AWS/Lambda
       MetricName: Errors
       Dimensions:
@@ -575,8 +712,9 @@ Resources:
       OKActions:
         - !Ref AlertsTopic
 
-  # 5XX = OUR fault (server-side). 4XX (bad input, no token) is the caller's
-  # fault, so it's shown on the dashboard but deliberately NOT alarmed on.
+  # 5XX = OUR fault (server-side), now including "couldn't write to the intake
+  # queue". 4XX (bad input, no token) is the caller's fault, so it's shown on
+  # the dashboard but deliberately NOT alarmed on.
   Api5xxErrorsAlarm:
     Type: AWS::CloudWatch::Alarm
     Properties:
@@ -669,6 +807,29 @@ Resources:
       OKActions:
         - !Ref AlertsTopic
 
+  # Intake backlog: orders accepted (202) but not saved within 5 minutes.
+  # Customers think their order is placed, so this matters more than ever.
+  OrderIntakeQueueBacklogAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: project4-order-intake-queue-backlog
+      AlarmDescription: Accepted orders are waiting more than 5 minutes to be saved
+      Namespace: AWS/SQS
+      MetricName: ApproximateAgeOfOldestMessage
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt OrderIntakeQueue.QueueName
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 300
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlertsTopic
+      OKActions:
+        - !Ref AlertsTopic
+
   # Backlog check: if the oldest message has waited over 5 minutes, FulfilOrder
   # isn't keeping up (or is failing). Age is a better signal than message count:
   # 100 messages that clear in seconds is fine; 1 message stuck for an hour isn't.
@@ -698,8 +859,8 @@ Resources:
   # Dashboard laid out in the order an order travels:
   #   Row 0: alarm status (red/green at a glance)
   #   Row 1: API Gateway -> CreateOrder -> FulfilOrder
-  #   Row 2: EventBridge matched / failed / DLQ, and SQS throughput
-  #   Row 3: SQS backlog, and SNS delivery
+  #   Row 2: EventBridge matched / failed / DLQ, and SQS throughput (both queues)
+  #   Row 3: SQS backlog (both queues), and SNS delivery
   # The body is JSON inside !Sub, so ${...} inserts names and ARNs. (Comments
   # can't go inside the JSON block - they'd become part of it and break it.)
   # Rule names are written out because !Ref on a rule on a custom bus returns
@@ -723,6 +884,7 @@ Resources:
                   "${FulfilmentRuleFailedInvocationsAlarm.Arn}",
                   "${NotificationRuleFailedInvocationsAlarm.Arn}",
                   "${NotificationsFailedAlarm.Arn}",
+                  "${OrderIntakeQueueBacklogAlarm.Arn}",
                   "${FulfilmentQueueBacklogAlarm.Arn}"
                 ]
               }
@@ -791,11 +953,12 @@ Resources:
             {
               "type": "metric", "x": 16, "y": 9, "width": 8, "height": 6,
               "properties": {
-                "title": "4. SQS - messages in and out",
+                "title": "4. SQS - messages in and out (intake + fulfilment)",
                 "region": "${AWS::Region}", "stat": "Sum", "period": 60, "view": "timeSeries",
                 "metrics": [
+                  ["AWS/SQS", "NumberOfMessagesSent", "QueueName", "${OrderIntakeQueue.QueueName}"],
+                  ["AWS/SQS", "NumberOfMessagesDeleted", "QueueName", "${OrderIntakeQueue.QueueName}"],
                   ["AWS/SQS", "NumberOfMessagesSent", "QueueName", "${FulfilmentQueue.QueueName}"],
-                  ["AWS/SQS", "NumberOfMessagesReceived", "QueueName", "${FulfilmentQueue.QueueName}"],
                   ["AWS/SQS", "NumberOfMessagesDeleted", "QueueName", "${FulfilmentQueue.QueueName}"]
                 ]
               }
@@ -806,7 +969,9 @@ Resources:
                 "title": "4. SQS - backlog (messages waiting, age of oldest)",
                 "region": "${AWS::Region}", "period": 60, "view": "timeSeries",
                 "metrics": [
+                  ["AWS/SQS", "ApproximateNumberOfMessagesVisible", "QueueName", "${OrderIntakeQueue.QueueName}", {"stat": "Maximum"}],
                   ["AWS/SQS", "ApproximateNumberOfMessagesVisible", "QueueName", "${FulfilmentQueue.QueueName}", {"stat": "Maximum"}],
+                  ["AWS/SQS", "ApproximateAgeOfOldestMessage", "QueueName", "${OrderIntakeQueue.QueueName}", {"stat": "Maximum", "yAxis": "right"}],
                   ["AWS/SQS", "ApproximateAgeOfOldestMessage", "QueueName", "${FulfilmentQueue.QueueName}", {"stat": "Maximum", "yAxis": "right"}]
                 ]
               }
@@ -850,6 +1015,8 @@ Outputs:
     Value: !GetAtt OrdersEventBus.Arn
   OrderEventsLogGroupName:
     Value: !Ref OrderEventsLogGroup
+  OrderIntakeQueueUrl:
+    Value: !Ref OrderIntakeQueue
   FulfilmentQueueUrl:
     Value: !Ref FulfilmentQueue
   FulfilmentQueueArn:
