@@ -10,6 +10,8 @@
 #     -> SNS topic -> email notification
 #     -> CloudWatch Logs (debug copy of every event)
 #   GET /orders/{id} -> API Gateway -> DynamoDB directly (no Lambda)
+# Reliability: each SQS queue has a dead-letter queue (DLQ); a message that
+#              fails 3 times is moved aside and an alarm fires
 # Monitoring: CloudWatch dashboard + alarms (emailed via an alerts topic),
 #             X-Ray tracing on the API and both Lambdas
 # =============================================================================
@@ -115,10 +117,33 @@ Resources:
         AccessToken: minutes
 
   # ---------------------------------------------------------------------------
-  # ORDER INTAKE (Exercise 6)
+  # ORDER INTAKE (Exercise 6) + its dead-letter queue (Exercise 7)
   # API Gateway writes new orders straight into this queue; CreateOrder
   # consumes it. The API answers 202 without waiting for processing.
   # ---------------------------------------------------------------------------
+
+  # Dead-letter queue: receives intake messages that failed 3 times, so they
+  # stop being retried but are KEPT for a human to inspect and redrive.
+  OrderIntakeDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: project4-order-intake-dlq
+      # 14 days - the maximum. A message keeps its ORIGINAL timestamp when it
+      # moves to a DLQ, so the DLQ must keep messages longer than the source
+      # queue (4 days), or old failures would expire before anyone sees them.
+      MessageRetentionPeriod: 1209600
+      SqsManagedSseEnabled: true
+      # Only the intake queue may use this DLQ. The ARN is built from the name
+      # with !Sub (not !GetAtt) on purpose: the intake queue already references
+      # THIS queue, and referencing it back would be a circular dependency
+      # that CloudFormation refuses to deploy.
+      RedriveAllowPolicy:
+        redrivePermission: byQueue
+        sourceQueueArns:
+          - !Sub arn:aws:sqs:${AWS::Region}:${AWS::AccountId}:project4-order-intake-queue
+      Tags:
+        - Key: Project
+          Value: project4-event-driven
 
   # Holds accepted orders until CreateOrder processes them. If CreateOrder or
   # DynamoDB is having problems, orders wait here safely instead of failing.
@@ -129,6 +154,12 @@ Resources:
       VisibilityTimeout: 60             # >= 6x the Lambda timeout (10s), so a slow attempt isn't duplicated
       MessageRetentionPeriod: 345600    # 4 days
       SqsManagedSseEnabled: true        # encrypted at rest
+      # After 3 failed receives, SQS moves the message to the DLQ instead of
+      # retrying it for 4 days. 3 = enough to ride out a brief glitch (throttling,
+      # a deploy), few enough that a truly broken message is set aside quickly.
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt OrderIntakeDLQ.Arn
+        maxReceiveCount: 3
       Tags:
         - Key: Project
           Value: project4-event-driven
@@ -418,7 +449,7 @@ Resources:
           Arn: !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:${OrderEventsLogGroup}
 
   # ---------------------------------------------------------------------------
-  # FULFILMENT (Exercise 2)
+  # FULFILMENT (Exercise 2) + its dead-letter queue (Exercise 7)
   # OrderCreated -> rule -> FulfilmentQueue -> FulfilOrder Lambda -> FulfilmentsTable
   # ---------------------------------------------------------------------------
 
@@ -442,6 +473,22 @@ Resources:
         - Key: Project
           Value: project4-event-driven
 
+  # Dead-letter queue for fulfilment messages that failed 3 times.
+  # Same settings and reasoning as OrderIntakeDLQ.
+  FulfilmentDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: project4-fulfilment-dlq
+      MessageRetentionPeriod: 1209600   # 14 days - longer than the source queue's 4
+      SqsManagedSseEnabled: true
+      RedriveAllowPolicy:
+        redrivePermission: byQueue
+        sourceQueueArns:
+          - !Sub arn:aws:sqs:${AWS::Region}:${AWS::AccountId}:project4-fulfilment-queue
+      Tags:
+        - Key: Project
+          Value: project4-event-driven
+
   # Buffer between EventBridge and FulfilOrder: absorbs spikes, keeps messages
   # safe if the Lambda is failing, and retries them automatically.
   FulfilmentQueue:
@@ -454,6 +501,9 @@ Resources:
       VisibilityTimeout: 60
       MessageRetentionPeriod: 345600    # 4 days (in seconds) before an unprocessed message is deleted
       SqsManagedSseEnabled: true        # encrypt messages at rest, using SQS-managed keys (free)
+      RedrivePolicy:                    # 3 failed attempts -> move to the DLQ
+        deadLetterTargetArn: !GetAtt FulfilmentDLQ.Arn
+        maxReceiveCount: 3
       Tags:
         - Key: Project
           Value: project4-event-driven
@@ -579,7 +629,6 @@ Resources:
 
   # Consumes the intake queue: saves each accepted order to DynamoDB, then
   # announces it by publishing an OrderCreated event to the bus.
-  # (No longer called by API Gateway - so CreateOrderApiPermission was removed.)
   CreateOrderFunction:
     Type: AWS::Serverless::Function     # SAM shorthand: expands into a Lambda function plus its IAM role
     Properties:
@@ -638,7 +687,7 @@ Resources:
               - ReportBatchItemFailures
 
   # ---------------------------------------------------------------------------
-  # ALERTING (Exercise 4)
+  # ALERTING (Exercises 4 and 7)
   # Alarms watch metrics for us and email the alerts topic when something breaks.
   # Common settings on every alarm below:
   #   Period 60 + EvaluationPeriods 1 -> judge each 1-minute window on its own
@@ -667,6 +716,51 @@ Resources:
       TopicArn: !Ref AlertsTopic
       Protocol: email
       Endpoint: !Ref NotificationEmail
+
+  # ANY message in the intake DLQ = an accepted order (customer got 202)
+  # that could NOT be saved. This is the most important alarm in the system.
+  OrderIntakeDLQAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: project4-order-intake-dlq-not-empty
+      AlarmDescription: Accepted orders failed 3 times and were moved to the intake DLQ - investigate and redrive
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt OrderIntakeDLQ.QueueName
+      Statistic: Maximum
+      Period: 300                       # SQS queue-depth metrics arrive every few minutes
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold   # even ONE message is worth knowing about
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlertsTopic
+      OKActions:
+        - !Ref AlertsTopic
+
+  # ANY message in the fulfilment DLQ = an order that won't be shipped
+  FulfilmentDLQAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: project4-fulfilment-dlq-not-empty
+      AlarmDescription: Fulfilment messages failed 3 times and were moved to the fulfilment DLQ - investigate and redrive
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt FulfilmentDLQ.QueueName
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlertsTopic
+      OKActions:
+        - !Ref AlertsTopic
 
   # Any CreateOrder error = accepted orders aren't being saved
   CreateOrderErrorsAlarm:
@@ -712,7 +806,7 @@ Resources:
       OKActions:
         - !Ref AlertsTopic
 
-  # 5XX = OUR fault (server-side), now including "couldn't write to the intake
+  # 5XX = OUR fault (server-side), including "couldn't write to the intake
   # queue". 4XX (bad input, no token) is the caller's fault, so it's shown on
   # the dashboard but deliberately NOT alarmed on.
   Api5xxErrorsAlarm:
@@ -855,12 +949,12 @@ Resources:
         - !Ref AlertsTopic
 
   # ---------------------------------------------------------------------------
-  # MONITORING (Exercise 4)
+  # MONITORING (Exercises 4 and 7)
   # Dashboard laid out in the order an order travels:
   #   Row 0: alarm status (red/green at a glance)
   #   Row 1: API Gateway -> CreateOrder -> FulfilOrder
   #   Row 2: EventBridge matched / failed / DLQ, and SQS throughput (both queues)
-  #   Row 3: SQS backlog (both queues), and SNS delivery
+  #   Row 3: SQS backlog + DLQ depth, and SNS delivery
   # The body is JSON inside !Sub, so ${...} inserts names and ARNs. (Comments
   # can't go inside the JSON block - they'd become part of it and break it.)
   # Rule names are written out because !Ref on a rule on a custom bus returns
@@ -878,6 +972,8 @@ Resources:
               "properties": {
                 "title": "Alarms",
                 "alarms": [
+                  "${OrderIntakeDLQAlarm.Arn}",
+                  "${FulfilmentDLQAlarm.Arn}",
                   "${CreateOrderErrorsAlarm.Arn}",
                   "${FulfilOrderErrorsAlarm.Arn}",
                   "${Api5xxErrorsAlarm.Arn}",
@@ -966,11 +1062,13 @@ Resources:
             {
               "type": "metric", "x": 0, "y": 15, "width": 12, "height": 6,
               "properties": {
-                "title": "4. SQS - backlog (messages waiting, age of oldest)",
+                "title": "4. SQS - backlog and dead-letter queues",
                 "region": "${AWS::Region}", "period": 60, "view": "timeSeries",
                 "metrics": [
                   ["AWS/SQS", "ApproximateNumberOfMessagesVisible", "QueueName", "${OrderIntakeQueue.QueueName}", {"stat": "Maximum"}],
                   ["AWS/SQS", "ApproximateNumberOfMessagesVisible", "QueueName", "${FulfilmentQueue.QueueName}", {"stat": "Maximum"}],
+                  ["AWS/SQS", "ApproximateNumberOfMessagesVisible", "QueueName", "${OrderIntakeDLQ.QueueName}", {"stat": "Maximum"}],
+                  ["AWS/SQS", "ApproximateNumberOfMessagesVisible", "QueueName", "${FulfilmentDLQ.QueueName}", {"stat": "Maximum"}],
                   ["AWS/SQS", "ApproximateAgeOfOldestMessage", "QueueName", "${OrderIntakeQueue.QueueName}", {"stat": "Maximum", "yAxis": "right"}],
                   ["AWS/SQS", "ApproximateAgeOfOldestMessage", "QueueName", "${FulfilmentQueue.QueueName}", {"stat": "Maximum", "yAxis": "right"}]
                 ]
@@ -1017,10 +1115,14 @@ Outputs:
     Value: !Ref OrderEventsLogGroup
   OrderIntakeQueueUrl:
     Value: !Ref OrderIntakeQueue
+  OrderIntakeDLQUrl:
+    Value: !Ref OrderIntakeDLQ
   FulfilmentQueueUrl:
     Value: !Ref FulfilmentQueue
   FulfilmentQueueArn:
     Value: !GetAtt FulfilmentQueue.Arn
+  FulfilmentDLQUrl:
+    Value: !Ref FulfilmentDLQ
   FulfilmentsTableName:
     Value: !Ref FulfilmentsTable
   FulfilOrderFunctionArn:
