@@ -1,11 +1,15 @@
 # =============================================================================
 # Project 4 - Event-Driven Orders Application
+# Deployed to TWO regions from this one template (Exercise 9):
+#   PRIMARY   (London, eu-west-2)  - serves the API, owns the DR controls
+#   SECONDARY (Ireland, eu-west-1) - standby copy that receives events on failover
 # Flow:
 #   POST /orders -> API Gateway (Cognito auth + JSON Schema validation)
 #                -> SQS intake queue -> returns 202 Accepted immediately
 #   Intake queue -> CreateOrder Lambda (idempotent: tracks each order's progress)
-#                -> DynamoDB Orders table -> EventBridge (OrderCreated event)
-#   OrderCreated fans out to three independent consumers:
+#                -> DynamoDB Orders table
+#                -> EventBridge GLOBAL ENDPOINT -> primary bus (or secondary on failover)
+#   OrderCreated fans out to three independent consumers (in whichever region received it):
 #     -> SQS fulfilment queue -> FulfilOrder Lambda -> DynamoDB Fulfilments table
 #     -> SNS topic -> email notification
 #     -> CloudWatch Logs (debug copy of every event)
@@ -20,8 +24,6 @@ Transform: AWS::Serverless-2016-10-31   # makes this a SAM template (enables AWS
 Description: Project 4 - Event-Driven Orders Application
 
 # Values supplied at deploy time instead of being written into the template.
-# The pipeline passes NotificationEmail from a GitHub secret, so the address
-# never appears in this public repo.
 Parameters:
   NotificationEmail:
     Type: String
@@ -29,6 +31,22 @@ Parameters:
     Description: Email address that receives order notifications and alarm alerts
     AllowedPattern: '^[^@\s]+@[^@\s]+\.[^@\s]+$'   # basic email shape check - fails fast if the secret is missing
     ConstraintDescription: must be a valid email address
+  # Exercise 9: the two regions of the disaster recovery pair. The same values
+  # are used by both stacks, so each one knows which role it plays.
+  PrimaryRegion:
+    Type: String
+    Default: eu-west-2
+    Description: Region that normally receives events (London)
+  SecondaryRegion:
+    Type: String
+    Default: eu-west-1
+    Description: Region that receives events when the primary is unhealthy (Ireland)
+
+# Conditions decide which resources exist in which region. The DR controls
+# (failover switch, health check, global endpoint) and the dashboard are only
+# created in the primary region.
+Conditions:
+  IsPrimaryRegion: !Equals [!Ref "AWS::Region", !Ref PrimaryRegion]
 
 # Settings applied to every function/API in this template, so they aren't repeated
 Globals:
@@ -50,7 +68,7 @@ Resources:
   # ---------------------------------------------------------------------------
 
   # Stores orders. One row per item: orderId groups an order's rows, itemId tells them apart.
-  # Regular single-region table - multi-region returns in the Global Endpoints exercise.
+  # Each region has its own copy - data is NOT replicated between regions in this exercise.
   OrdersTable:
     Type: AWS::DynamoDB::Table
     Properties:
@@ -89,8 +107,6 @@ Resources:
         - AttributeName: orderId
           KeyType: HASH
       # TTL: DynamoDB deletes each row (free) once its expiresAt time passes.
-      # Duplicates only arrive within minutes or hours, so 7 days is plenty -
-      # and the table never grows forever.
       TimeToLiveSpecification:
         AttributeName: expiresAt
         Enabled: true
@@ -160,9 +176,7 @@ Resources:
       MessageRetentionPeriod: 1209600
       SqsManagedSseEnabled: true
       # Only the intake queue may use this DLQ. The ARN is built from the name
-      # with !Sub (not !GetAtt) on purpose: the intake queue already references
-      # THIS queue, and referencing it back would be a circular dependency
-      # that CloudFormation refuses to deploy.
+      # with !Sub (not !GetAtt) to avoid a circular dependency.
       RedriveAllowPolicy:
         redrivePermission: byQueue
         sourceQueueArns:
@@ -171,8 +185,7 @@ Resources:
         - Key: Project
           Value: project4-event-driven
 
-  # Holds accepted orders until CreateOrder processes them. If CreateOrder or
-  # DynamoDB is having problems, orders wait here safely instead of failing.
+  # Holds accepted orders until CreateOrder processes them.
   OrderIntakeQueue:
     Type: AWS::SQS::Queue
     Properties:
@@ -180,10 +193,7 @@ Resources:
       VisibilityTimeout: 60             # >= 6x the Lambda timeout (10s), so a slow attempt isn't duplicated
       MessageRetentionPeriod: 345600    # 4 days
       SqsManagedSseEnabled: true        # encrypted at rest
-      # After 3 failed receives, SQS moves the message to the DLQ instead of
-      # retrying it for 4 days. 3 = enough to ride out a brief glitch (throttling,
-      # a deploy), few enough that a truly broken message is set aside quickly.
-      RedrivePolicy:
+      RedrivePolicy:                    # 3 failed attempts -> move to the DLQ
         deadLetterTargetArn: !GetAtt OrderIntakeDLQ.Arn
         maxReceiveCount: 3
       Tags:
@@ -268,8 +278,7 @@ Resources:
             validateRequestBody: true
             validateRequestParameters: false
 
-        # Custom error for failed validation. The default just says "Invalid
-        # request body"; this adds WHICH rule failed, so callers can fix it.
+        # Custom error for failed validation, saying WHICH rule failed.
         x-amazon-apigateway-gateway-responses:
           BAD_REQUEST_BODY:
             statusCode: 400
@@ -300,25 +309,15 @@ Resources:
               x-amazon-apigateway-integration:
                 type: aws                 # direct AWS service integration - no Lambda
                 httpMethod: POST          # SQS's API is called with POST
-                # "sqs:path/<account>/<queue>" = call the SQS API for this queue
                 uri: !Sub arn:aws:apigateway:${AWS::Region}:sqs:path/${AWS::AccountId}/${OrderIntakeQueue.QueueName}
                 credentials: !GetAtt ApiGatewaySqsSendRole.Arn
                 passthroughBehavior: never   # reject content types we have no template for (415)
-                # SQS's API expects form-encoded parameters, not JSON
                 requestParameters:
                   integration.request.header.Content-Type: "'application/x-www-form-urlencoded'"
-                # Builds the SendMessage call:
-                #   MessageBody   = the client's JSON, URL-encoded
-                #   orderId       = $context.requestId (unique ID API Gateway gives every request)
-                #   acceptedAt    = when API Gateway received it (epoch milliseconds)
-                # The IDs travel as MESSAGE ATTRIBUTES - metadata alongside the body.
+                # SendMessage call: body = client JSON; orderId + acceptedAt as message attributes
                 requestTemplates:
                   application/json: 'Action=SendMessage&MessageBody=$util.urlEncode($input.body)&MessageAttribute.1.Name=orderId&MessageAttribute.1.Value.DataType=String&MessageAttribute.1.Value.StringValue=$context.requestId&MessageAttribute.2.Name=acceptedAt&MessageAttribute.2.Value.DataType=Number&MessageAttribute.2.Value.StringValue=$context.requestTimeEpoch'
-                # Map SQS's reply to OUR response. Keys are patterns matched
-                # against SQS's HTTP status:
-                #   2xx     -> 202 with the orderId
-                #   default -> anything else (SQS error) -> 500, so failures aren't
-                #              hidden behind a fake "accepted"
+                # 2xx from SQS -> 202 with the orderId; anything else -> honest 500
                 responses:
                   '2\d{2}':
                     statusCode: '202'
@@ -352,9 +351,8 @@ Resources:
                 uri: !Join ["", ["arn:aws:apigateway:", !Ref "AWS::Region", ":dynamodb:action/Query"]]
                 credentials: !GetAtt ApiGatewayDynamoDBReadRole.Arn
                 passthroughBehavior: never
-                # Request template: turns the URL's orderId into a DynamoDB Query.
-                # The table name is hard-coded because this is VTL text, not a CloudFormation
-                # property - keep it in sync with OrdersTable.TableName.
+                # Turns the URL's orderId into a DynamoDB Query. Table name is hard-coded
+                # (VTL text, not a CloudFormation property) - keep in sync with OrdersTable.
                 requestTemplates:
                   application/json: |
                     {
@@ -364,8 +362,7 @@ Resources:
                         ":o": {"S": "$util.escapeJavaScript($input.params('orderId'))"}
                       }
                     }
-                # Response template: reshapes DynamoDB's typed JSON ({"S": "..."}) into
-                # clean JSON, and returns 404 when no rows were found.
+                # Reshapes DynamoDB's typed JSON into clean JSON; 404 when nothing found.
                 responses:
                   default:
                     statusCode: '200'
@@ -388,9 +385,7 @@ Resources:
                         }
                         #end
 
-        # JSON Schema (draft 4) for a valid order. API Gateway enforces it
-        # before anything is queued - this replaces the validation that used
-        # to live at the top of the CreateOrder Lambda.
+        # JSON Schema (draft 4) for a valid order, enforced by API Gateway.
         components:
           schemas:
             Order:
@@ -406,9 +401,8 @@ Resources:
                 items:
                   type: array
                   minItems: 1
-                  # A DynamoDB transaction allows at most 100 operations. CreateOrder
-                  # writes one row per item PLUS one update to the idempotency table,
-                  # so the limit is 99 items, not 100.
+                  # A DynamoDB transaction allows at most 100 operations: one per item
+                  # PLUS one update to the idempotency table, so 99 items max.
                   maxItems: 99
                   items:
                     type: object
@@ -434,9 +428,8 @@ Resources:
   # EVENTS (Exercise 1)
   # ---------------------------------------------------------------------------
 
-  # Custom event bus for this app. The account's "default" bus receives AWS
-  # service events; a custom bus keeps our order events separate, so our
-  # rules only ever see our events.
+  # Custom event bus. MUST have the same name in both regions - the global
+  # endpoint fails over to "the bus with this name" in the secondary region.
   OrdersEventBus:
     Type: AWS::Events::EventBus
     Properties:
@@ -445,9 +438,7 @@ Resources:
         - Key: Project
           Value: project4-event-driven
 
-  # DEBUG: a bus with no rules silently discards events. This log group, plus
-  # the rule below, keeps a copy of every order event so we can see what's
-  # being published.
+  # DEBUG: keeps a copy of every order event so we can see what's being published.
   OrderEventsLogGroup:
     Type: AWS::Logs::LogGroup
     Properties:
@@ -455,7 +446,6 @@ Resources:
       RetentionInDays: 7                              # auto-delete after a week, so costs stay at ~0
 
   # Resource policy ON the log group, allowing EventBridge to write into it.
-  # Without this the rule still matches, but nothing arrives - and no error is shown.
   OrderEventsLogGroupPolicy:
     Type: AWS::Logs::ResourcePolicy
     Properties:
@@ -470,7 +460,7 @@ Resources:
       Name: project4-log-all-order-events
       EventBusName: !Ref OrdersEventBus    # listen on our custom bus, not "default"
       State: ENABLED
-      EventPattern:                        # which events match: only those with this source
+      EventPattern:
         source:
           - project4.orders
       Targets:
@@ -482,9 +472,7 @@ Resources:
   # OrderCreated -> rule -> FulfilmentQueue -> FulfilOrder Lambda -> FulfilmentsTable
   # ---------------------------------------------------------------------------
 
-  # One row per order, recording its fulfilment status. Separate from the
-  # Orders table because it belongs to a different part of the business
-  # (the warehouse), which owns its own data.
+  # One row per order, recording its fulfilment status.
   FulfilmentsTable:
     Type: AWS::DynamoDB::Table
     Properties:
@@ -503,7 +491,6 @@ Resources:
           Value: project4-event-driven
 
   # Dead-letter queue for fulfilment messages that failed 3 times.
-  # Same settings and reasoning as OrderIntakeDLQ.
   FulfilmentDLQ:
     Type: AWS::SQS::Queue
     Properties:
@@ -518,18 +505,14 @@ Resources:
         - Key: Project
           Value: project4-event-driven
 
-  # Buffer between EventBridge and FulfilOrder: absorbs spikes, keeps messages
-  # safe if the Lambda is failing, and retries them automatically.
+  # Buffer between EventBridge and FulfilOrder.
   FulfilmentQueue:
     Type: AWS::SQS::Queue
     Properties:
       QueueName: project4-fulfilment-queue
-      # How long a message is hidden from other consumers while Lambda works on it.
-      # AWS recommends at least 6x the function timeout (10s), so a slow attempt
-      # isn't handed to a second Lambda while the first is still running.
-      VisibilityTimeout: 60
-      MessageRetentionPeriod: 345600    # 4 days (in seconds) before an unprocessed message is deleted
-      SqsManagedSseEnabled: true        # encrypt messages at rest, using SQS-managed keys (free)
+      VisibilityTimeout: 60             # >= 6x the Lambda timeout
+      MessageRetentionPeriod: 345600    # 4 days
+      SqsManagedSseEnabled: true
       RedrivePolicy:                    # 3 failed attempts -> move to the DLQ
         deadLetterTargetArn: !GetAtt FulfilmentDLQ.Arn
         maxReceiveCount: 3
@@ -537,9 +520,7 @@ Resources:
         - Key: Project
           Value: project4-event-driven
 
-  # Resource policy ON the queue: lets EventBridge send messages into it, but
-  # ONLY from our fulfilment rule. Without this, the rule matches events but
-  # delivery silently fails.
+  # Lets EventBridge send into the queue, but ONLY from our fulfilment rule.
   FulfilmentQueuePolicy:
     Type: AWS::SQS::QueuePolicy
     Properties:
@@ -555,13 +536,9 @@ Resources:
             Resource: !GetAtt FulfilmentQueue.Arn
             Condition:
               ArnEquals:
-                # Without this condition, ANY EventBridge rule in ANY account
-                # could push messages into the queue (the "confused deputy" problem)
-                aws:SourceArn: !GetAtt OrderCreatedToFulfilmentRule.Arn
+                aws:SourceArn: !GetAtt OrderCreatedToFulfilmentRule.Arn   # prevents the "confused deputy" problem
 
   # Rule: "OrderCreated events from our app -> the fulfilment queue".
-  # More specific than the debug rule: it also matches on detail-type, so
-  # future event types (e.g. OrderCancelled) won't be sent to fulfilment.
   OrderCreatedToFulfilmentRule:
     Type: AWS::Events::Rule
     Properties:
@@ -579,34 +556,29 @@ Resources:
 
   # ---------------------------------------------------------------------------
   # NOTIFICATIONS (Exercise 3)
-  # OrderCreated -> rule (reshapes the event into a readable sentence)
-  #              -> SNS topic -> email subscription
   # ---------------------------------------------------------------------------
 
   # Pub/sub topic: every message published here is PUSHED to all subscribers.
-  # Today that's one email address; SMS, HTTP endpoints or Lambdas could be
-  # added as subscribers later without changing anything else.
   OrderNotificationsTopic:
     Type: AWS::SNS::Topic
     Properties:
       TopicName: project4-order-notifications
-      DisplayName: Project4 Orders      # shown as the sender name on notification emails
+      # Sender name on the emails - includes the region, so you can SEE which
+      # region handled each order (London normally, Ireland after failover)
+      DisplayName: !Sub Project4 Orders ${AWS::Region}
       Tags:
         - Key: Project
           Value: project4-event-driven
 
-  # Email subscriber. AWS sends a confirmation email first - nothing is
-  # delivered until the link in it is clicked (stops people being spammed
-  # by subscriptions they never agreed to).
+  # Email subscriber - must be confirmed by clicking the link AWS emails you.
   OrderNotificationsEmailSubscription:
     Type: AWS::SNS::Subscription
     Properties:
       TopicArn: !Ref OrderNotificationsTopic   # !Ref on an SNS topic returns its ARN
       Protocol: email
-      Endpoint: !Ref NotificationEmail         # from the Parameters section (GitHub secret)
+      Endpoint: !Ref NotificationEmail
 
-  # Resource policy ON the topic: lets EventBridge publish to it, but ONLY
-  # from our notification rule. Same pattern as the SQS queue policy.
+  # Lets EventBridge publish to the topic, but ONLY from our notification rule.
   OrderNotificationsTopicPolicy:
     Type: AWS::SNS::TopicPolicy
     Properties:
@@ -624,10 +596,8 @@ Resources:
               ArnEquals:
                 aws:SourceArn: !GetAtt OrderCreatedToNotificationRule.Arn
 
-  # Rule: "OrderCreated -> SNS topic", with an INPUT TRANSFORMER.
-  # Without the transformer, the email body would be the raw event JSON.
-  # The transformer picks fields out of the event (InputPathsMap) and drops
-  # them into a sentence (InputTemplate) - no Lambda needed to format it.
+  # Rule: "OrderCreated -> SNS topic", with an INPUT TRANSFORMER that turns
+  # the event into a readable sentence (no Lambda needed).
   OrderCreatedToNotificationRule:
     Type: AWS::Events::Rule
     Properties:
@@ -648,39 +618,124 @@ Resources:
               customerId: $.detail.customerId
               itemCount: $.detail.itemCount
               createdAt: $.detail.createdAt
-            # <name> placeholders are replaced with the values above. The outer
-            # single quotes are YAML; the inner double quotes make it a JSON string.
-            InputTemplate: '"New order <orderId> from customer <customerId>: <itemCount> item(s), placed at <createdAt>."'
+              # Exercise 9: EventBridge stamps every event with the region of the
+              # bus that RECEIVED it - proof of where the global endpoint sent it
+              region: $.region
+            InputTemplate: '"New order <orderId> from customer <customerId>: <itemCount> item(s), placed at <createdAt>. Processed in <region>."'
+
+  # ---------------------------------------------------------------------------
+  # DISASTER RECOVERY (Exercise 9) - PRIMARY REGION ONLY
+  # Failover switch alarm -> Route 53 health check -> global endpoint
+  #   switch = 0 (or no data) -> alarm OK    -> health check HEALTHY   -> events to London
+  #   switch = 1              -> alarm ALARM -> health check UNHEALTHY -> events to Ireland
+  # In production the alarm would watch REAL failure signals (error rates,
+  # latency). Here it watches a metric you control, so failover can be tested
+  # on demand - a "game day".
+  # ---------------------------------------------------------------------------
+
+  # The failover switch. TreatMissingData: ignore = the alarm keeps its last
+  # state when no new data arrives, so a single "1" keeps it in ALARM until
+  # you send a "0". (Before any data it's INSUFFICIENT_DATA, which the health
+  # check below treats as healthy.)
+  FailoverSwitchAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: IsPrimaryRegion
+    Properties:
+      AlarmName: project4-primary-region-failover-switch
+      AlarmDescription: Primary region marked unhealthy - EventBridge global endpoint is failing over to the secondary region
+      Namespace: Project4/DR            # a custom namespace for our own metric
+      MetricName: PrimaryRegionFailoverSwitch
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: ignore
+      AlarmActions:
+        - !Ref AlertsTopic              # email when failover starts...
+      OKActions:
+        - !Ref AlertsTopic              # ...and when it ends
+
+  # Route 53 health check that is healthy/unhealthy based on the alarm above.
+  # The global endpoint watches THIS to decide which region gets events.
+  PrimaryRegionHealthCheck:
+    Type: AWS::Route53::HealthCheck
+    Condition: IsPrimaryRegion
+    Properties:
+      HealthCheckConfig:
+        Type: CLOUDWATCH_METRIC
+        AlarmIdentifier:
+          Name: !Ref FailoverSwitchAlarm    # !Ref on an alarm returns its name
+          Region: !Ref "AWS::Region"
+        InsufficientDataHealthStatus: Healthy   # no data yet = assume healthy
+      HealthCheckTags:
+        - Key: Name
+          Value: project4-primary-region-health
+
+  # The global endpoint. Publishers send events HERE instead of to a regional
+  # bus; it forwards them to the primary bus while the health check is healthy,
+  # and to the same-named bus in the secondary region when it isn't.
+  OrdersGlobalEndpoint:
+    Type: AWS::Events::Endpoint
+    Condition: IsPrimaryRegion
+    Properties:
+      Name: project4-orders-global-endpoint
+      Description: Routes OrderCreated events to London, failing over to Ireland
+      RoutingConfig:
+        FailoverConfig:
+          Primary:
+            HealthCheck: !Sub arn:aws:route53:::healthcheck/${PrimaryRegionHealthCheck}
+          Secondary:
+            Route: !Ref SecondaryRegion
+      # Replication OFF: with it on, every event is ALSO copied to the secondary
+      # region, whose consumers would process it a second time (duplicate emails
+      # and fulfilment). Trade-off: events in flight at the exact moment of
+      # failover could be lost - a higher RPO (recovery point objective).
+      ReplicationConfig:
+        State: DISABLED
+      EventBuses:
+        - EventBusArn: !GetAtt OrdersEventBus.Arn
+        - EventBusArn: !Sub arn:aws:events:${SecondaryRegion}:${AWS::AccountId}:event-bus/project4-orders-bus
 
   # ---------------------------------------------------------------------------
   # COMPUTE
   # ---------------------------------------------------------------------------
 
-  # Consumes the intake queue: saves each accepted order to DynamoDB, then
-  # announces it by publishing an OrderCreated event. Idempotent: tracks each
-  # order's progress in OrderIdempotencyTable so retries and duplicates are safe.
+  # Consumes the intake queue: saves each accepted order (idempotently), then
+  # publishes OrderCreated - through the global endpoint in the primary region,
+  # or straight to the local bus in the secondary region.
   CreateOrderFunction:
-    Type: AWS::Serverless::Function     # SAM shorthand: expands into a Lambda function plus its IAM role
+    Type: AWS::Serverless::Function
     Properties:
       FunctionName: project4-create-order
       Description: Idempotently saves queued orders and publishes OrderCreated events
-      CodeUri: src/create-order/        # folder SAM packages and uploads as the function's code
-      Handler: index.handler            # file "index", exported function "handler"
-      Tracing: Active                   # X-Ray traces: see each call this function makes and how long it takes
+      CodeUri: src/create-order/
+      Handler: index.handler
+      Tracing: Active
       Environment:
-        Variables:                      # read in code via process.env, so nothing is hard-coded
-          TABLE_NAME: !Ref OrdersTable          # !Ref on a table returns its name
+        Variables:
+          TABLE_NAME: !Ref OrdersTable
           IDEMPOTENCY_TABLE_NAME: !Ref OrderIdempotencyTable
-          EVENT_BUS_NAME: !Ref OrdersEventBus   # !Ref on an event bus returns its name
-      Policies:                         # SAM builds the function's IAM role from these
-        - DynamoDBWritePolicy:          # write-only, Orders table only
+          EVENT_BUS_NAME: !Ref OrdersEventBus
+          # Primary region: the global endpoint's ID. Secondary region: the
+          # variable is left out entirely (AWS::NoValue), so the code publishes
+          # straight to its local bus.
+          EVENT_ENDPOINT_ID: !If [IsPrimaryRegion, !GetAtt OrdersGlobalEndpoint.EndpointId, !Ref "AWS::NoValue"]
+      Policies:
+        - DynamoDBWritePolicy:
             TableName: !Ref OrdersTable
-        - DynamoDBCrudPolicy:           # read + write the progress board (must READ status to resume)
+        - DynamoDBCrudPolicy:
             TableName: !Ref OrderIdempotencyTable
-        - EventBridgePutEventsPolicy:   # events:PutEvents on this bus only - least privilege
-            EventBusName: !Ref OrdersEventBus
+        # Through a global endpoint, an event can land on EITHER region's bus,
+        # so the function needs PutEvents on both - still least privilege:
+        # only these two named buses.
+        - Statement:
+            - Effect: Allow
+              Action: events:PutEvents
+              Resource:
+                - !Sub arn:aws:events:${PrimaryRegion}:${AWS::AccountId}:event-bus/project4-orders-bus
+                - !Sub arn:aws:events:${SecondaryRegion}:${AWS::AccountId}:event-bus/project4-orders-bus
       Events:
-        # Lambda polls the intake queue and invokes this function with batches
         OrderIntakeQueueEvent:
           Type: SQS
           Properties:
@@ -702,47 +757,33 @@ Resources:
         Variables:
           FULFILMENTS_TABLE_NAME: !Ref FulfilmentsTable
       Policies:
-        - DynamoDBWritePolicy:          # write-only, Fulfilments table only
+        - DynamoDBWritePolicy:
             TableName: !Ref FulfilmentsTable
-        # (No SQS policy needed here: SAM automatically grants permission to
-        #  read and delete messages from the queue named in the event below.)
       Events:
-        # Creates an "event source mapping": Lambda's own service polls the
-        # queue and invokes this function with batches of messages.
         FulfilmentQueueEvent:
           Type: SQS
           Properties:
             Queue: !GetAtt FulfilmentQueue.Arn
-            BatchSize: 10               # up to 10 messages per invocation
+            BatchSize: 10
             FunctionResponseTypes:
-              # Lets the function report WHICH messages in a batch failed, so only
-              # those are retried - not the whole batch of 10.
               - ReportBatchItemFailures
 
   # ---------------------------------------------------------------------------
-  # ALERTING (Exercises 4 and 7)
-  # Alarms watch metrics for us and email the alerts topic when something breaks.
-  # Common settings on every alarm below:
-  #   Period 60 + EvaluationPeriods 1 -> judge each 1-minute window on its own
-  #   TreatMissingData: notBreaching  -> NO data means "nothing happened", which
-  #     is fine. Many of these metrics only appear when there's activity, so
-  #     without this the alarms would sit in INSUFFICIENT_DATA most of the time.
-  #   OKActions -> also email when the alarm recovers, so you know it's resolved
+  # ALERTING (Exercises 4 and 7) - created in BOTH regions
+  # Common settings: 1-minute windows, TreatMissingData notBreaching (no data =
+  # nothing happened), OKActions so you're told when an alarm recovers.
   # ---------------------------------------------------------------------------
 
-  # Separate topic for engineering alerts - a different audience from order
-  # notifications. No topic policy needed: CloudWatch alarms in the same
-  # account can publish with the topic's default policy.
+  # Separate topic for engineering alerts - a different audience from order notifications.
   AlertsTopic:
     Type: AWS::SNS::Topic
     Properties:
       TopicName: project4-alerts
-      DisplayName: Project4 Alerts
+      DisplayName: !Sub Project4 Alerts ${AWS::Region}
       Tags:
         - Key: Project
           Value: project4-event-driven
 
-  # Needs confirming by email, just like the order notifications subscription
   AlertsEmailSubscription:
     Type: AWS::SNS::Subscription
     Properties:
@@ -750,8 +791,7 @@ Resources:
       Protocol: email
       Endpoint: !Ref NotificationEmail
 
-  # ANY message in the intake DLQ = an accepted order (customer got 202)
-  # that could NOT be saved. This is the most important alarm in the system.
+  # ANY message in the intake DLQ = an accepted order that could NOT be saved.
   OrderIntakeDLQAlarm:
     Type: AWS::CloudWatch::Alarm
     Properties:
@@ -763,10 +803,10 @@ Resources:
         - Name: QueueName
           Value: !GetAtt OrderIntakeDLQ.QueueName
       Statistic: Maximum
-      Period: 300                       # SQS queue-depth metrics arrive every few minutes
+      Period: 300
       EvaluationPeriods: 1
       Threshold: 0
-      ComparisonOperator: GreaterThanThreshold   # even ONE message is worth knowing about
+      ComparisonOperator: GreaterThanThreshold
       TreatMissingData: notBreaching
       AlarmActions:
         - !Ref AlertsTopic
@@ -795,7 +835,6 @@ Resources:
       OKActions:
         - !Ref AlertsTopic
 
-  # Any CreateOrder error = accepted orders aren't being saved
   CreateOrderErrorsAlarm:
     Type: AWS::CloudWatch::Alarm
     Properties:
@@ -810,14 +849,13 @@ Resources:
       Period: 60
       EvaluationPeriods: 1
       Threshold: 0
-      ComparisonOperator: GreaterThanThreshold   # alarm on ANY error
+      ComparisonOperator: GreaterThanThreshold
       TreatMissingData: notBreaching
       AlarmActions:
         - !Ref AlertsTopic
       OKActions:
         - !Ref AlertsTopic
 
-  # Any FulfilOrder error = orders are being retried and may not be fulfilled
   FulfilOrderErrorsAlarm:
     Type: AWS::CloudWatch::Alarm
     Properties:
@@ -839,9 +877,7 @@ Resources:
       OKActions:
         - !Ref AlertsTopic
 
-  # 5XX = OUR fault (server-side), including "couldn't write to the intake
-  # queue". 4XX (bad input, no token) is the caller's fault, so it's shown on
-  # the dashboard but deliberately NOT alarmed on.
+  # 5XX = our fault; 4XX (caller's fault) is on the dashboard but not alarmed.
   Api5xxErrorsAlarm:
     Type: AWS::CloudWatch::Alarm
     Properties:
@@ -863,8 +899,6 @@ Resources:
       OKActions:
         - !Ref AlertsTopic
 
-  # EventBridge matched an event but couldn't deliver it to the queue
-  # (e.g. a broken queue policy). Events can be lost silently without this.
   FulfilmentRuleFailedInvocationsAlarm:
     Type: AWS::CloudWatch::Alarm
     Properties:
@@ -872,7 +906,7 @@ Resources:
       AlarmDescription: EventBridge failed to deliver OrderCreated events to the fulfilment queue
       Namespace: AWS/Events
       MetricName: FailedInvocations
-      Dimensions:                       # rules on custom buses are identified by bus + rule name
+      Dimensions:
         - Name: EventBusName
           Value: !Ref OrdersEventBus
         - Name: RuleName
@@ -888,7 +922,6 @@ Resources:
       OKActions:
         - !Ref AlertsTopic
 
-  # Same check for the notification rule -> SNS topic
   NotificationRuleFailedInvocationsAlarm:
     Type: AWS::CloudWatch::Alarm
     Properties:
@@ -912,7 +945,6 @@ Resources:
       OKActions:
         - !Ref AlertsTopic
 
-  # SNS accepted the message but couldn't deliver it to a subscriber
   NotificationsFailedAlarm:
     Type: AWS::CloudWatch::Alarm
     Properties:
@@ -934,8 +966,6 @@ Resources:
       OKActions:
         - !Ref AlertsTopic
 
-  # Intake backlog: orders accepted (202) but not saved within 5 minutes.
-  # Customers think their order is placed, so this matters more than ever.
   OrderIntakeQueueBacklogAlarm:
     Type: AWS::CloudWatch::Alarm
     Properties:
@@ -957,9 +987,6 @@ Resources:
       OKActions:
         - !Ref AlertsTopic
 
-  # Backlog check: if the oldest message has waited over 5 minutes, FulfilOrder
-  # isn't keeping up (or is failing). Age is a better signal than message count:
-  # 100 messages that clear in seconds is fine; 1 message stuck for an hour isn't.
   FulfilmentQueueBacklogAlarm:
     Type: AWS::CloudWatch::Alarm
     Properties:
@@ -970,10 +997,10 @@ Resources:
       Dimensions:
         - Name: QueueName
           Value: !GetAtt FulfilmentQueue.QueueName
-      Statistic: Maximum                # the single oldest message, not an average
-      Period: 300                       # 5-minute windows - SQS reports these metrics every few minutes
+      Statistic: Maximum
+      Period: 300
       EvaluationPeriods: 1
-      Threshold: 300                    # seconds
+      Threshold: 300
       ComparisonOperator: GreaterThanThreshold
       TreatMissingData: notBreaching
       AlarmActions:
@@ -982,19 +1009,12 @@ Resources:
         - !Ref AlertsTopic
 
   # ---------------------------------------------------------------------------
-  # MONITORING (Exercises 4 and 7)
-  # Dashboard laid out in the order an order travels:
-  #   Row 0: alarm status (red/green at a glance)
-  #   Row 1: API Gateway -> CreateOrder -> FulfilOrder
-  #   Row 2: EventBridge matched / failed / DLQ, and SQS throughput (both queues)
-  #   Row 3: SQS backlog + DLQ depth, and SNS delivery
-  # The body is JSON inside !Sub, so ${...} inserts names and ARNs. (Comments
-  # can't go inside the JSON block - they'd become part of it and break it.)
-  # Rule names are written out because !Ref on a rule on a custom bus returns
-  # "bus-name|rule-name", not just the rule name.
+  # MONITORING (Exercises 4 and 7) - PRIMARY REGION ONLY
+  # (Saves a dashboard's cost in the standby region.)
   # ---------------------------------------------------------------------------
   OrdersDashboard:
     Type: AWS::CloudWatch::Dashboard
+    Condition: IsPrimaryRegion
     Properties:
       DashboardName: project4-orders-dashboard
       DashboardBody: !Sub |
@@ -1005,6 +1025,7 @@ Resources:
               "properties": {
                 "title": "Alarms",
                 "alarms": [
+                  "${FailoverSwitchAlarm.Arn}",
                   "${OrderIntakeDLQAlarm.Arn}",
                   "${FulfilmentDLQAlarm.Arn}",
                   "${CreateOrderErrorsAlarm.Arn}",
@@ -1126,12 +1147,8 @@ Resources:
 Outputs:
   OrdersTableName:
     Value: !Ref OrdersTable
-  OrdersTableArn:
-    Value: !GetAtt OrdersTable.Arn
   OrderIdempotencyTableName:
     Value: !Ref OrderIdempotencyTable
-  CreateOrderFunctionArn:
-    Value: !GetAtt CreateOrderFunction.Arn
   OrdersApiUrl:
     Description: POST orders to this URL
     Value: !Join ["", ["https://", !Ref OrdersApi, ".execute-api.", !Ref "AWS::Region", ".amazonaws.com/prod/orders"]]
@@ -1139,30 +1156,29 @@ Outputs:
     Value: !Ref OrdersUserPool
   UserPoolClientId:
     Value: !Ref OrdersUserPoolClient
-  DashboardUrl:
-    Description: Open this to see the dashboard
-    Value: !Join ["", ["https://", !Ref "AWS::Region", ".console.aws.amazon.com/cloudwatch/home?region=", !Ref "AWS::Region", "#dashboards:name=project4-orders-dashboard"]]
-  OrdersEventBusName:
-    Value: !Ref OrdersEventBus
   OrdersEventBusArn:
     Value: !GetAtt OrdersEventBus.Arn
-  OrderEventsLogGroupName:
-    Value: !Ref OrderEventsLogGroup
   OrderIntakeQueueUrl:
     Value: !Ref OrderIntakeQueue
   OrderIntakeDLQUrl:
     Value: !Ref OrderIntakeDLQ
   FulfilmentQueueUrl:
     Value: !Ref FulfilmentQueue
-  FulfilmentQueueArn:
-    Value: !GetAtt FulfilmentQueue.Arn
   FulfilmentDLQUrl:
     Value: !Ref FulfilmentDLQ
   FulfilmentsTableName:
     Value: !Ref FulfilmentsTable
-  FulfilOrderFunctionArn:
-    Value: !GetAtt FulfilOrderFunction.Arn
   OrderNotificationsTopicArn:
     Value: !Ref OrderNotificationsTopic
   AlertsTopicArn:
     Value: !Ref AlertsTopic
+  # Exercise 9 outputs - primary region only
+  GlobalEndpointId:
+    Condition: IsPrimaryRegion
+    Value: !GetAtt OrdersGlobalEndpoint.EndpointId
+  GlobalEndpointUrl:
+    Condition: IsPrimaryRegion
+    Value: !GetAtt OrdersGlobalEndpoint.EndpointUrl
+  PrimaryRegionHealthCheckId:
+    Condition: IsPrimaryRegion
+    Value: !Ref PrimaryRegionHealthCheck

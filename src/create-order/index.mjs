@@ -1,5 +1,5 @@
 // =============================================================================
-// CreateOrder Lambda  (idempotent - Exercise 8)
+// CreateOrder Lambda  (idempotent - Exercise 8; global endpoint - Exercise 9)
 // Triggered by: SQS intake queue (project4-order-intake-queue), batches of up to 10
 // Each message = one order accepted by API Gateway (already validated there):
 //   body                         -> the client's JSON { customerId, items }
@@ -11,12 +11,14 @@
 //
 //   (no row) --claim--> IN_PROGRESS --save--> ORDER_SAVED --publish--> COMPLETED
 //
-// A message that arrives again (SQS retry, or a duplicate delivery) reads the
-// board and RESUMES from the missing step:
-//   COMPLETED   -> nothing to do (duplicate)
-//   ORDER_SAVED -> skip saving, just publish the event
-//   IN_PROGRESS -> claimed by another invocation right now -> retry later
+// A message that arrives again reads the board and RESUMES from the missing step.
 // =============================================================================
+
+// Exercise 9: publishing to a GLOBAL ENDPOINT uses SigV4a - a request signature
+// valid in more than one region. Importing this package switches the SDK's
+// SigV4a support on. It has to be bundled in this function (see package.json)
+// alongside the SDK clients below, so they all share the same SDK copy.
+import "@aws-sdk/signature-v4-crt";
 
 import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
 import { DynamoDBDocumentClient, TransactWriteCommand, UpdateCommand, GetCommand } from "@aws-sdk/lib-dynamodb";
@@ -29,17 +31,19 @@ const TABLE_NAME = process.env.TABLE_NAME;
 const IDEMPOTENCY_TABLE_NAME = process.env.IDEMPOTENCY_TABLE_NAME;
 const EVENT_BUS_NAME = process.env.EVENT_BUS_NAME;
 
-// How long a claim ("lock") lasts. Longer than the Lambda timeout (10s), so a
-// lock can't expire while its owner is still working. Shorter than the queue's
-// visibility timeout (60s), so by the time SQS retries a message, any lock left
-// behind by a crashed invocation has already expired.
+// Exercise 9: set in the PRIMARY region only (the template leaves it out in
+// the secondary). When set, events go via the global endpoint, which picks
+// the healthy region; when not set, they go straight to the local bus.
+const EVENT_ENDPOINT_ID = process.env.EVENT_ENDPOINT_ID;
+
+// Lock length: longer than the Lambda timeout (10s), shorter than the queue's
+// visibility timeout (60s) - see Exercise 8 for why.
 const LOCK_MS = 30_000;
 
 // Board rows are deleted automatically (DynamoDB TTL) after this many days
 const RECORD_TTL_DAYS = 7;
 
-// Thrown when another invocation is working on the same order. It's treated
-// as a normal failure, so SQS simply retries the message a minute later.
+// Thrown when another invocation is working on the same order -> SQS retries later
 class OrderLockedError extends Error {
   constructor(orderId) {
     super(`Order ${orderId} is being processed by another invocation - retry later`);
@@ -48,14 +52,8 @@ class OrderLockedError extends Error {
 }
 
 // --- Step 1: CLAIM the order on the progress board ---------------------------
-// One conditional write does the "check and claim" atomically, which is what
-// prevents race conditions: if two Lambdas get the same message at the same
-// moment, DynamoDB lets exactly ONE of them succeed.
-//
-// The claim succeeds when EITHER:
-//   - the order isn't on the board yet (first time we've seen it), OR
-//   - it isn't COMPLETED and the previous claim has expired (an earlier
-//     attempt crashed or timed out part-way - we take over and resume)
+// One conditional write does "check and claim" atomically, so if two Lambdas
+// get the same message at once, DynamoDB lets exactly ONE succeed.
 const claimOrder = async (orderId) => {
   const now = Date.now();
   const lockedUntil = now + LOCK_MS;
@@ -65,14 +63,10 @@ const claimOrder = async (orderId) => {
       new UpdateCommand({
         TableName: IDEMPOTENCY_TABLE_NAME,
         Key: { orderId },
-        // if_not_exists(...) keeps an existing value - so a resumed order keeps
-        // its ORDER_SAVED status and its original expiry time
         UpdateExpression:
           "SET lockedUntil = :lockedUntil, #status = if_not_exists(#status, :inProgress), expiresAt = if_not_exists(expiresAt, :expiresAt)",
         ConditionExpression: "attribute_not_exists(orderId) OR (#status <> :completed AND lockedUntil < :now)",
-        // "status" is a reserved word in DynamoDB, so it must be referenced
-        // through a placeholder (#status) instead of written directly
-        ExpressionAttributeNames: { "#status": "status" },
+        ExpressionAttributeNames: { "#status": "status" },   // "status" is a DynamoDB reserved word
         ExpressionAttributeValues: {
           ":lockedUntil": lockedUntil,
           ":inProgress": "IN_PROGRESS",
@@ -80,15 +74,14 @@ const claimOrder = async (orderId) => {
           ":completed": "COMPLETED",
           ":now": now,
         },
-        ReturnValues: "ALL_NEW",   // give back the row as it is now, so we know where to resume
+        ReturnValues: "ALL_NEW",   // the row as it is now, so we know where to resume
       })
     );
     return { record: Attributes, lockedUntil };
   } catch (err) {
     if (err.name !== "ConditionalCheckFailedException") throw err;
 
-    // The claim was refused. Read the row to find out why.
-    // ConsistentRead = read the very latest write, not a possibly stale copy.
+    // Claim refused - read the row to find out why
     const { Item } = await client.send(
       new GetCommand({ TableName: IDEMPOTENCY_TABLE_NAME, Key: { orderId }, ConsistentRead: true })
     );
@@ -100,8 +93,6 @@ const claimOrder = async (orderId) => {
 };
 
 // --- Step 2: SAVE the order rows + mark ORDER_SAVED, in ONE transaction -------
-// Both happen together or not at all, so the board can never say ORDER_SAVED
-// while the order is missing - or the other way round.
 const saveOrder = async (orderId, lockedUntil, summary) => {
   const orderRows = summary.items.map((item) => ({
     Put: {
@@ -115,12 +106,8 @@ const saveOrder = async (orderId, lockedUntil, summary) => {
     Update: {
       TableName: IDEMPOTENCY_TABLE_NAME,
       Key: { orderId },
-      // Store the order summary too - this is the "existing result" a retry
-      // reuses to publish the event, without rebuilding anything
-      UpdateExpression: "SET #status = :saved, orderSummary = :summary",
-      // Only if WE still hold the claim. If our lock expired and another
-      // invocation took over, this fails and the whole transaction is cancelled.
-      ConditionExpression: "lockedUntil = :lockedUntil",
+      UpdateExpression: "SET #status = :saved, orderSummary = :summary",   // store the "existing result"
+      ConditionExpression: "lockedUntil = :lockedUntil",                   // only if WE still hold the claim
       ExpressionAttributeNames: { "#status": "status" },
       ExpressionAttributeValues: { ":saved": "ORDER_SAVED", ":summary": summary, ":lockedUntil": lockedUntil },
     },
@@ -130,20 +117,23 @@ const saveOrder = async (orderId, lockedUntil, summary) => {
     await client.send(new TransactWriteCommand({ TransactItems: [...orderRows, markSaved] }));
   } catch (err) {
     if (err.name === "TransactionCanceledException") {
-      // We lost the claim part-way - let the current owner finish the job
-      throw new OrderLockedError(orderId);
+      throw new OrderLockedError(orderId);   // we lost the claim - let the current owner finish
     }
     throw err;
   }
 };
 
 // --- Step 3: PUBLISH OrderCreated --------------------------------------------
-// Unlike before, a failure here now THROWS. That's safe: the board says
-// ORDER_SAVED, so the retry skips straight to publishing - the event is no
-// longer lost (the gap noted in Exercise 6 is closed).
+// Throws on failure: safe, because the board says ORDER_SAVED and a retry
+// resumes right here.
 const publishOrderCreated = async (orderId, summary) => {
   const result = await eventBridge.send(
     new PutEventsCommand({
+      // Exercise 9: with an EndpointId, the SDK sends the event to the global
+      // endpoint (SigV4a-signed), which forwards it to the bus with this
+      // EventBusName in whichever region is currently healthy. Without one
+      // (secondary region), it goes straight to the local bus as before.
+      EndpointId: EVENT_ENDPOINT_ID || undefined,
       Entries: [
         {
           EventBusName: EVENT_BUS_NAME,
@@ -171,7 +161,7 @@ const markCompleted = async (orderId, lockedUntil, eventId) => {
         TableName: IDEMPOTENCY_TABLE_NAME,
         Key: { orderId },
         UpdateExpression: "SET #status = :completed, publishedEventId = :eventId, completedAt = :completedAt REMOVE lockedUntil",
-        ConditionExpression: "lockedUntil = :lockedUntil",   // only if we still hold the claim
+        ConditionExpression: "lockedUntil = :lockedUntil",
         ExpressionAttributeNames: { "#status": "status" },
         ExpressionAttributeValues: {
           ":completed": "COMPLETED",
@@ -182,9 +172,8 @@ const markCompleted = async (orderId, lockedUntil, eventId) => {
       })
     );
   } catch (err) {
-    // Our claim expired after we published, and another invocation took over.
-    // It will publish and finish - the event may go out twice, which is why
-    // every consumer must be idempotent too (FulfilOrder already is).
+    // Our claim expired after publishing and another invocation took over - it
+    // will finish. The event may go out twice; consumers are idempotent.
     if (err.name === "ConditionalCheckFailedException") {
       console.warn(JSON.stringify({ message: "Lost claim before marking COMPLETED - another invocation will finish", orderId }));
       return;
@@ -195,33 +184,29 @@ const markCompleted = async (orderId, lockedUntil, eventId) => {
 
 // --- Process ONE queued order --------------------------------------------------
 const processRecord = async (record) => {
-  // READ the IDs API Gateway attached as message attributes
   const orderId = record.messageAttributes?.orderId?.stringValue;
   const acceptedAtMs = Number(record.messageAttributes?.acceptedAt?.stringValue);
   if (!orderId) {
     throw new Error("Message has no orderId attribute");
   }
 
-  // PARSE the order. API Gateway's JSON Schema already validated it; this is
-  // only a safety net in case something else ever writes to the queue.
+  // Safety net only - API Gateway's JSON Schema already validated the body
   const { customerId, items } = JSON.parse(record.body);
   if (!customerId || !Array.isArray(items) || items.length === 0 || items.length > 99) {
     throw new Error("Order body is invalid");
   }
 
-  // 1. CLAIM - and find out where this order got to last time (if anywhere)
+  // 1. CLAIM
   const claim = await claimOrder(orderId);
   if (claim.alreadyCompleted) {
-    // "Return the existing result": nothing is re-saved or re-published
     console.log(JSON.stringify({ message: "Duplicate - order already completed, nothing to do", orderId, publishedEventId: claim.record.publishedEventId }));
     return;
   }
   const { record: progress, lockedUntil } = claim;
 
-  // 2. SAVE - only if it hasn't been saved already
-  let summary = progress.orderSummary;   // present if an earlier attempt saved the order
+  // 2. SAVE - only if not saved already
+  let summary = progress.orderSummary;
   if (progress.status === "IN_PROGRESS") {
-    // createdAt = when the CUSTOMER placed it (API Gateway's timestamp)
     const createdAt = Number.isFinite(acceptedAtMs) ? new Date(acceptedAtMs).toISOString() : new Date().toISOString();
     summary = {
       customerId,
@@ -240,9 +225,9 @@ const processRecord = async (record) => {
     console.log(JSON.stringify({ message: "Resuming - order already saved, publishing event", orderId }));
   }
 
-  // 3. PUBLISH (throws on failure -> SQS retries -> resumes right here)
+  // 3. PUBLISH (via the global endpoint in the primary region)
   const eventId = await publishOrderCreated(orderId, summary);
-  console.log(JSON.stringify({ message: "OrderCreated event published", orderId, eventId }));
+  console.log(JSON.stringify({ message: "OrderCreated event published", orderId, eventId, viaGlobalEndpoint: Boolean(EVENT_ENDPOINT_ID) }));
 
   // 4. COMPLETE
   await markCompleted(orderId, lockedUntil, eventId);
@@ -258,10 +243,9 @@ export const handler = async (event) => {
       await processRecord(record);
     } catch (err) {
       console.error(JSON.stringify({ message: "Failed to process order message", messageId: record.messageId, error: err.name, detail: err.message }));
-      batchItemFailures.push({ itemIdentifier: record.messageId });   // retry just this one
+      batchItemFailures.push({ itemIdentifier: record.messageId });
     }
   }
 
-  // This return value is for SQS: which messages to retry
   return { batchItemFailures };
 };
