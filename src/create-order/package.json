@@ -2,11 +2,5 @@
   "name": "create-order",
   "version": "1.0.0",
   "type": "module",
-  "main": "index.mjs",
-  "dependencies": {
-    "@aws-sdk/client-dynamodb": "^3.1153.0",
-    "@aws-sdk/client-eventbridge": "^3.1153.0",
-    "@aws-sdk/lib-dynamodb": "^3.1153.0",
-    "@aws-sdk/signature-v4-crt": "^3.1153.0"
-  }
+  "main": "index.mjs"
 }

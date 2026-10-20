@@ -1,7 +1,7 @@
 # =============================================================================
 # CI/CD for Project 4
 #   Pull request to main -> validate only (no AWS access)
-#   Push to main         -> validate, build once, deploy to BOTH regions
+#   Push to main         -> validate, then build and deploy with SAM
 # AWS access uses OIDC: no long-lived keys are stored in GitHub.
 # =============================================================================
 name: Deploy SAM application
@@ -21,24 +21,21 @@ jobs:
   validate:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4          # download the repo onto the runner
 
-      - uses: aws-actions/setup-sam@v2
+      - uses: aws-actions/setup-sam@v2     # install the SAM CLI
         with:
           use-installer: true
 
       - name: Lint template
         run: sam validate --lint
 
-  # Job 2: build once, then deploy the same build to both regions
+  # Job 2: build and deploy - only on pushes to main, and only if validate passed
   deploy:
     needs: validate
     if: github.event_name == 'push'
     runs-on: ubuntu-latest
-    concurrency: deploy-production         # never run two deploys at once
-    env:
-      # Masked as *** in logs. Passed via env, not inline, to avoid script injection.
-      NOTIFICATION_EMAIL: ${{ secrets.NOTIFICATION_EMAIL }}
+    concurrency: deploy-production         # never run two deploys at once - they'd clash on the same stack
     steps:
       - uses: actions/checkout@v4
 
@@ -50,7 +47,8 @@ jobs:
         with:
           use-installer: true
 
-      # IAM roles are global, so one OIDC login works for both regions
+      # Swap GitHub's OIDC token for temporary AWS credentials (about 1 hour),
+      # by assuming the role created from infra/github-oidc-role.yaml
       - name: Configure AWS credentials (OIDC)
         uses: aws-actions/configure-aws-credentials@v4
         with:
@@ -58,22 +56,17 @@ jobs:
           aws-region: eu-west-2
 
       - name: Build
-        run: sam build                     # one build artifact, deployed twice
+        run: sam build                     # packages each function's code into .aws-sam/
 
-      # SECONDARY FIRST: the global endpoint (created in London) points at
-      # Ireland's event bus, so that bus must already exist.
-      - name: Deploy secondary region (Ireland, eu-west-1)
+      # The email secret is passed through an environment variable rather than
+      # written straight into the command - GitHub's recommended pattern, because
+      # a value inserted directly into a "run" script could be read as shell code
+      # (script injection). GitHub also masks secrets as *** in logs.
+      - name: Deploy
+        env:
+          NOTIFICATION_EMAIL: ${{ secrets.NOTIFICATION_EMAIL }}
         run: >-
           sam deploy
-          --region eu-west-1
-          --no-confirm-changeset
-          --no-fail-on-empty-changeset
-          --parameter-overrides "NotificationEmail=$NOTIFICATION_EMAIL"
-
-      - name: Deploy primary region (London, eu-west-2)
-        run: >-
-          sam deploy
-          --region eu-west-2
           --no-confirm-changeset
           --no-fail-on-empty-changeset
           --parameter-overrides "NotificationEmail=$NOTIFICATION_EMAIL"
