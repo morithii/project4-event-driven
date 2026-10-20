@@ -3,8 +3,8 @@
 # Flow:
 #   POST /orders -> API Gateway (Cognito auth + JSON Schema validation)
 #                -> SQS intake queue -> returns 202 Accepted immediately
-#   Intake queue -> CreateOrder Lambda -> DynamoDB Orders table
-#                -> EventBridge (OrderCreated event)
+#   Intake queue -> CreateOrder Lambda (idempotent: tracks each order's progress)
+#                -> DynamoDB Orders table -> EventBridge (OrderCreated event)
 #   OrderCreated fans out to three independent consumers:
 #     -> SQS fulfilment queue -> FulfilOrder Lambda -> DynamoDB Fulfilments table
 #     -> SNS topic -> email notification
@@ -68,6 +68,32 @@ Resources:
           KeyType: RANGE                # sort key: orders rows within the same orderId
       PointInTimeRecoverySpecification:
         PointInTimeRecoveryEnabled: true   # restore the table to any second in the last 35 days
+      Tags:
+        - Key: Project
+          Value: project4-event-driven
+
+  # Exercise 8: the "progress board". One row per orderId recording how far
+  # CreateOrder got: IN_PROGRESS -> ORDER_SAVED -> COMPLETED. A retried or
+  # duplicate message reads this and resumes from the missing step instead of
+  # redoing (or skipping) work. Kept in its own table so the Orders table -
+  # and the GET /orders/{id} response built from it - only ever holds order data.
+  OrderIdempotencyTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: project4-order-idempotency
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: orderId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: orderId
+          KeyType: HASH
+      # TTL: DynamoDB deletes each row (free) once its expiresAt time passes.
+      # Duplicates only arrive within minutes or hours, so 7 days is plenty -
+      # and the table never grows forever.
+      TimeToLiveSpecification:
+        AttributeName: expiresAt
+        Enabled: true
       Tags:
         - Key: Project
           Value: project4-event-driven
@@ -380,7 +406,10 @@ Resources:
                 items:
                   type: array
                   minItems: 1
-                  maxItems: 100             # DynamoDB transactions allow at most 100 operations
+                  # A DynamoDB transaction allows at most 100 operations. CreateOrder
+                  # writes one row per item PLUS one update to the idempotency table,
+                  # so the limit is 99 items, not 100.
+                  maxItems: 99
                   items:
                     type: object
                     required:
@@ -628,22 +657,26 @@ Resources:
   # ---------------------------------------------------------------------------
 
   # Consumes the intake queue: saves each accepted order to DynamoDB, then
-  # announces it by publishing an OrderCreated event to the bus.
+  # announces it by publishing an OrderCreated event. Idempotent: tracks each
+  # order's progress in OrderIdempotencyTable so retries and duplicates are safe.
   CreateOrderFunction:
     Type: AWS::Serverless::Function     # SAM shorthand: expands into a Lambda function plus its IAM role
     Properties:
       FunctionName: project4-create-order
-      Description: Saves queued orders and publishes OrderCreated events
+      Description: Idempotently saves queued orders and publishes OrderCreated events
       CodeUri: src/create-order/        # folder SAM packages and uploads as the function's code
       Handler: index.handler            # file "index", exported function "handler"
       Tracing: Active                   # X-Ray traces: see each call this function makes and how long it takes
       Environment:
         Variables:                      # read in code via process.env, so nothing is hard-coded
           TABLE_NAME: !Ref OrdersTable          # !Ref on a table returns its name
+          IDEMPOTENCY_TABLE_NAME: !Ref OrderIdempotencyTable
           EVENT_BUS_NAME: !Ref OrdersEventBus   # !Ref on an event bus returns its name
       Policies:                         # SAM builds the function's IAM role from these
-        - DynamoDBWritePolicy:          # write-only, this table only
+        - DynamoDBWritePolicy:          # write-only, Orders table only
             TableName: !Ref OrdersTable
+        - DynamoDBCrudPolicy:           # read + write the progress board (must READ status to resume)
+            TableName: !Ref OrderIdempotencyTable
         - EventBridgePutEventsPolicy:   # events:PutEvents on this bus only - least privilege
             EventBusName: !Ref OrdersEventBus
       Events:
@@ -1095,6 +1128,8 @@ Outputs:
     Value: !Ref OrdersTable
   OrdersTableArn:
     Value: !GetAtt OrdersTable.Arn
+  OrderIdempotencyTableName:
+    Value: !Ref OrderIdempotencyTable
   CreateOrderFunctionArn:
     Value: !GetAtt CreateOrderFunction.Arn
   OrdersApiUrl:
